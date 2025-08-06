@@ -85,21 +85,73 @@ pub fn find_color_card_simplified(bgr: &core::Mat) -> Result<Option<[core::Point
     println!("图像总面积: {:.0}, 最小轮廓面积阈值: {:.0}", total_area, min_area);
     println!("过滤后的轮廓数量: {}", filtered_contours.len());
     
+    // 绘制所有轮廓
+    let mut contour_img = bgr.clone();
+    for i in 0..filtered_contours.len() {
+        let contour = filtered_contours.get(i)?;
+        imgproc::draw_contours(&mut contour_img, &filtered_contours, i as i32, 
+                              core::Scalar::new(0.0, 255.0, 0.0, 0.0), 2, 
+                              imgproc::LINE_8, &core::no_array(), i32::MAX, core::Point::new(0, 0))?;
+    }
+    ocv_bridge::save_debug_image(&contour_img, "04_detected_contours.png")?;
+    
     if filtered_contours.is_empty() {
         println!("方法1失败：未找到有效轮廓，尝试方法2...");
         return try_method_2(bgr, &gray);
     }
     
-    // 选择最佳轮廓 - 找到面积最大的轮廓
+    // 打印所有轮廓的信息
+    println!("所有轮廓信息:");
+    for i in 0..filtered_contours.len() {
+        let contour = filtered_contours.get(i)?;
+        let area = imgproc::contour_area(&contour, false)?;
+        let perimeter = imgproc::arc_length(&contour, true)?;
+        // 计算轮廓的紧凑度（面积/周长比）
+        let compactness = if perimeter > 0.0 {
+            4.0 * std::f64::consts::PI * area / (perimeter * perimeter)
+        } else {
+            0.0
+        };
+        println!("轮廓 {}: 面积={:.0}, 周长={:.0}, 紧凑度={:.3}", i, area, perimeter, compactness);
+    }
+    
+    // 选择最佳轮廓 - 不仅考虑面积，还考虑形状特征
     let mut best_contour = core::Vector::<core::Point>::new();
     let mut best_score = 0.0;
     
     for i in 0..filtered_contours.len() {
         let contour = filtered_contours.get(i)?;
         let area = imgproc::contour_area(&contour, false)?;
+        let perimeter = imgproc::arc_length(&contour, true)?;
         
-        if area > best_score {
-            best_score = area;
+        // 计算轮廓的凸包
+        let mut hull = core::Vector::<core::Point>::new();
+        imgproc::convex_hull(&contour, &mut hull, false, true)?;
+        let hull_area = imgproc::contour_area(&hull, false)?;
+        
+        // 计算凸性比例（轮廓面积/凸包面积）
+        let convexity_ratio = if hull_area > 0.0 { area / hull_area } else { 0.0 };
+        
+        // 计算紧凑度
+        let compactness = if perimeter > 0.0 {
+            4.0 * std::f64::consts::PI * area / (perimeter * perimeter)
+        } else {
+            0.0
+        };
+        
+        // 综合评分：面积权重最高，但也考虑形状特征
+        // 色卡通常是矩形，应该有较好的凸性比例和适中的紧凑度
+        let area_score = area / total_area;  // 面积占比
+        let shape_score = convexity_ratio * (compactness * 2.0).min(1.0);  // 形状评分
+        
+        // 综合评分
+        let total_score = area_score * 0.7 + shape_score * 0.3;
+        
+        println!("轮廓面积={:.0}, 凸性比例={:.3}, 紧凑度={:.3}, 综合评分={:.3}", 
+                 area, convexity_ratio, compactness, total_score);
+        
+        if total_score > best_score {
+            best_score = total_score;
             best_contour = contour;
         }
     }
@@ -109,10 +161,24 @@ pub fn find_color_card_simplified(bgr: &core::Mat) -> Result<Option<[core::Point
         return try_method_2(bgr, &gray);
     }
     
-    println!("选择的最佳轮廓面积: {:.0}", best_score);
+    println!("选择的最佳轮廓综合评分: {:.3}", best_score);
+    
+    // 绘制选择的最佳轮廓
+    let mut best_contour_img = bgr.clone();
+    let mut best_contours = core::Vector::<core::Vector<core::Point>>::new();
+    best_contours.push(best_contour.clone());
+    imgproc::draw_contours(&mut best_contour_img, &best_contours, -1, 
+                          core::Scalar::new(0.0, 255.0, 0.0, 0.0), 3, 
+                          imgproc::LINE_8, &core::no_array(), i32::MAX, core::Point::new(0, 0))?;
+    ocv_bridge::save_debug_image(&best_contour_img, "05_best_contour.png")?;
     
     // 轮廓近似获得四个角点
     if let Some(points) = get_four_corners(&best_contour)? {
+        // 绘制检测到的角点
+        let mut points_img = bgr.clone();
+        draw_points(&mut points_img, &points)?;
+        ocv_bridge::save_debug_image(&points_img, "06_detected_corners.png")?;
+        
         return Ok(Some(points));
     }
     
@@ -221,6 +287,34 @@ fn try_method_3(image: &core::Mat, gray: &core::Mat) -> Result<Option<[core::Poi
     Ok(None)
 }
 
+/// 在图像上绘制角点
+fn draw_points(image: &mut core::Mat, points: &[core::Point2f; 4]) -> Result<()> {
+    let colors = [
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0),   // 绿色 - 左上
+        core::Scalar::new(255.0, 0.0, 0.0, 0.0),   // 蓝色 - 右上  
+        core::Scalar::new(0.0, 0.0, 255.0, 0.0),   // 红色 - 右下
+        core::Scalar::new(255.0, 255.0, 0.0, 0.0), // 青色 - 左下
+    ];
+    
+    for (i, &point) in points.iter().enumerate() {
+        let center = core::Point::new(point.x as i32, point.y as i32);
+        
+        // 绘制圆点
+        imgproc::circle(image, center, 10, colors[i], -1, imgproc::LINE_8, 0)?;
+        
+        // 绘制数字标签
+        let text = format!("{}", i);
+        let font_face = imgproc::FONT_HERSHEY_SIMPLEX;
+        let font_scale = 1.0;
+        let thickness = 2;
+        
+        let text_pos = core::Point::new(point.x as i32 + 15, point.y as i32 + 15);
+        imgproc::put_text(image, &text, text_pos, font_face, font_scale, colors[i], thickness, imgproc::LINE_8, false)?;
+    }
+    
+    Ok(())
+}
+
 /// 从轮廓获取四个角点
 fn get_four_corners(contour: &core::Vector<core::Point>) -> Result<Option<[core::Point2f; 4]>> {
     // 轮廓近似 - 尝试不同的精度参数
@@ -244,6 +338,11 @@ fn get_four_corners(contour: &core::Vector<core::Point>) -> Result<Option<[core:
             // 排序四个角点
             let ordered_points = order_points(points)?;
             println!("检测到四个角点 (精度因子={})", epsilon_factor);
+            
+            // 保存检测到的角点图像用于调试
+            // 注意：这里我们暂时跳过绘制，因为需要传入原始图像才能绘制角点
+            // 实际使用中，调用方会负责绘制和保存最终的角点图像
+            
             return Ok(Some(ordered_points));
         } else if approx.len() > 4 {
             println!("角点过多 ({} 个)，尝试选择最外围的4个点...", approx.len());
@@ -294,6 +393,11 @@ fn order_points(pts: [core::Point2f; 4]) -> Result<[core::Point2f; 4]> {
 pub fn perspective_transform_from_points(bgr: &core::Mat, pts: [core::Point2f; 4]) -> Result<core::Mat> {
     let ordered_points = order_points(pts)?;
     
+    // 绘制排序后的角点
+    let mut ordered_points_img = bgr.clone();
+    draw_points(&mut ordered_points_img, &ordered_points)?;
+    ocv_bridge::save_debug_image(&ordered_points_img, "07_ordered_corners.png")?;
+    
     // 计算输出图像的宽度和高度
     let tl = ordered_points[0];
     let tr = ordered_points[1]; 
@@ -336,7 +440,7 @@ pub fn perspective_transform_from_points(bgr: &core::Mat, pts: [core::Point2f; 4
         core::Scalar::default()
     )?;
     
-    ocv_bridge::save_debug_image(&warped, "07_perspective_result.png")?;
+    ocv_bridge::save_debug_image(&warped, "08_perspective_result.png")?;
     
     Ok(warped)
 }
