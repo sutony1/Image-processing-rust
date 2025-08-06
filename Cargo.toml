@@ -1,0 +1,12 @@
+[package]
+name = "img_view_cv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+opencv = "0.95"
+winapi = { version = "0.3", features = [
+    "winuser", "libloaderapi", "wingdi", "windef", "commdlg", 
+    "processthreadsapi", "shellscalingapi", "minwindef", "basetsd"
+] }
