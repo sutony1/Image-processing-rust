@@ -88,7 +88,7 @@ pub fn find_color_card_simplified(bgr: &core::Mat) -> Result<Option<[core::Point
     // 绘制所有轮廓
     let mut contour_img = bgr.clone();
     for i in 0..filtered_contours.len() {
-        let contour = filtered_contours.get(i)?;
+        // 仅绘制所有轮廓
         imgproc::draw_contours(&mut contour_img, &filtered_contours, i as i32, 
                               core::Scalar::new(0.0, 255.0, 0.0, 0.0), 2, 
                               imgproc::LINE_8, &core::no_array(), i32::MAX, core::Point::new(0, 0))?;
@@ -381,10 +381,15 @@ fn order_points(pts: [core::Point2f; 4]) -> Result<[core::Point2f; 4]> {
     }
     
     // 按顺序排列：左上、右上、右下、左下
+    // 在图像坐标系中：
+    // - 左上: x+y 最小
+    // - 右下: x+y 最大
+    // - 右上: x-y 最大
+    // - 左下: x-y 最小
     rect[0] = pts[min_sum_idx];  // 左上 (x+y最小)
-    rect[1] = pts[min_diff_idx]; // 右上 (x-y最小)  
+    rect[1] = pts[max_diff_idx]; // 右上 (x-y最大)
     rect[2] = pts[max_sum_idx];  // 右下 (x+y最大)
-    rect[3] = pts[max_diff_idx]; // 左下 (x-y最大)
+    rect[3] = pts[min_diff_idx]; // 左下 (x-y最小)
     
     Ok(rect)
 }
@@ -451,6 +456,21 @@ pub fn perspective_transform_simplified(bgr: &core::Mat) -> Result<Option<core::
     if let Some(points) = find_color_card_simplified(bgr)? {
         // 执行透视变换
         let result = perspective_transform_from_points(bgr, points)?;
+
+        // 如果原图为竖向（高>=宽），而结果为横向（宽>高），则将结果旋转为竖向
+        let original_is_portrait = bgr.rows() >= bgr.cols();
+        let result_is_landscape = result.cols() > result.rows();
+
+        if original_is_portrait && result_is_landscape {
+            // 90° 顺时针旋转 = 转置 + 水平翻转
+            let mut transposed = core::Mat::default();
+            core::transpose(&result, &mut transposed)?;
+            let mut rotated = core::Mat::default();
+            core::flip(&transposed, &mut rotated, 1)?; // 1: 水平翻转
+            ocv_bridge::save_debug_image(&rotated, "09_oriented_result.png")?;
+            return Ok(Some(rotated));
+        }
+
         Ok(Some(result))
     } else {
         Ok(None)
