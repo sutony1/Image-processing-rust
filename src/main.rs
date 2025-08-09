@@ -24,12 +24,14 @@ const MENU_DILATE: u32 = 1006;
 const MENU_FIND_CONTOURS: u32 = 1007;
 const MENU_PERSPECTIVE_TRANSFORM: u32 = 1008;
 const MENU_RESTORE: u32 = 1009;
+const MENU_SAVE_FILE: u32 = 1010;
 
 // 全局变量存储图像数据
 static mut IMAGE_STATE: Option<ImageState> = None;
 
 struct ImageState {
     original_bgr: Option<core::Mat>,
+    current_mat: Option<core::Mat>,
     display_pixels: Vec<u8>,
     current_width: i32,
     current_height: i32,
@@ -39,6 +41,7 @@ impl ImageState {
     fn new() -> Self {
         Self {
             original_bgr: None,
+            current_mat: None,
             display_pixels: Vec::new(),
             current_width: 0,
             current_height: 0,
@@ -75,7 +78,9 @@ impl ImageState {
         // 转换为显示像素
         let image_buf = ocv_bridge::mat_to_bgra(&bgr)?;
         
+        let bgr_clone = bgr.try_clone()?;
         self.original_bgr = Some(bgr);
+        self.current_mat = Some(bgr_clone);
         self.display_pixels = image_buf.pixels;
         self.current_width = image_buf.w;
         self.current_height = image_buf.h;
@@ -105,7 +110,9 @@ impl ImageState {
         // 转换为显示像素
         let image_buf = ocv_bridge::mat_to_bgra(&bgr)?;
         
+        let bgr_clone = bgr.try_clone()?;
         self.original_bgr = Some(bgr);
+        self.current_mat = Some(bgr_clone);
         self.display_pixels = image_buf.pixels;
         self.current_width = image_buf.w;
         self.current_height = image_buf.h;
@@ -116,6 +123,7 @@ impl ImageState {
     
     fn update_display_from_mat(&mut self, mat: &core::Mat) -> Result<()> {
         let image_buf = ocv_bridge::mat_to_bgra(mat)?;
+        self.current_mat = Some(mat.try_clone()?);
         self.display_pixels = image_buf.pixels;
         self.current_width = image_buf.w;
         self.current_height = image_buf.h;
@@ -127,6 +135,38 @@ impl ImageState {
     }
 }
 
+// 使用OpenCV内存编码 + Rust文件写入，确保Windows下Unicode路径不乱码
+fn save_mat_with_unicode_path(mat: &core::Mat, path: &str) -> Result<String> {
+    // 解析并规范扩展名
+    let mut path_buf = std::path::PathBuf::from(path);
+    let ext_opt = path_buf.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase());
+
+    // 选择编码扩展（imencode需要以'.'开头），以及最终文件扩展（不带点）
+    let (encode_ext, file_ext): (&str, &str) = match ext_opt.as_deref() {
+        Some("png") => (".png", "png"),
+        Some("jpg") | Some("jpeg") => (".jpg", "jpg"),
+        Some("bmp") => (".bmp", "bmp"),
+        Some("tif") | Some("tiff") => (".tiff", "tiff"),
+        _ => (".png", "png"),
+    };
+
+    // 若没有扩展或不支持，则补上默认扩展
+    if ext_opt.is_none() || !matches!(ext_opt.as_deref(), Some("png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff")) {
+        path_buf.set_extension(file_ext);
+    }
+
+    // 使用OpenCV编码到内存
+    let mut buf = core::Vector::<u8>::new();
+    imgcodecs::imencode(encode_ext, mat, &mut buf, &core::Vector::new())
+        .context("OpenCV 内存编码失败")?;
+
+    // 通过Rust文件API写入，确保Unicode路径正确
+    std::fs::write(&path_buf, buf.to_vec())
+        .with_context(|| format!("写入文件失败: {}", path_buf.display()))?;
+
+    Ok(path_buf.to_string_lossy().to_string())
+}
+
 // 创建菜单
 unsafe fn create_menu() -> HMENU {
     let menu_bar = CreateMenu();
@@ -136,6 +176,9 @@ unsafe fn create_menu() -> HMENU {
     let open_file_text = "打开文件(&O)...";
     let open_file_utf16: Vec<u16> = open_file_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(file_menu, MF_STRING, MENU_OPEN_FILE as usize, open_file_utf16.as_ptr());
+    let save_file_text = "保存文件(&S)...";
+    let save_file_utf16: Vec<u16> = save_file_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(file_menu, MF_STRING, MENU_SAVE_FILE as usize, save_file_utf16.as_ptr());
     
     // 创建处理菜单
     let process_menu = CreatePopupMenu();
@@ -245,6 +288,49 @@ unsafe fn show_open_file_dialog(hwnd: HWND) -> Option<String> {
     }
 }
 
+// 显示文件保存对话框
+unsafe fn show_save_file_dialog(hwnd: HWND) -> Option<String> {
+    let mut file_name = [0u16; 260]; // MAX_PATH
+    let filter = "PNG 文件\0*.png\0JPEG 文件\0*.jpg;*.jpeg\0BMP 文件\0*.bmp\0TIFF 文件\0*.tiff\0所有文件\0*.*\0\0";
+    let filter_utf16: Vec<u16> = filter.encode_utf16().collect();
+    let title_utf16: Vec<u16> = "选择保存位置\0".encode_utf16().collect();
+    let def_ext_utf16: Vec<u16> = "png\0".encode_utf16().collect();
+    
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        hInstance: null_mut(),
+        lpstrFilter: filter_utf16.as_ptr(),
+        lpstrCustomFilter: null_mut(),
+        nMaxCustFilter: 0,
+        nFilterIndex: 1,
+        lpstrFile: file_name.as_mut_ptr(),
+        nMaxFile: file_name.len() as u32,
+        lpstrFileTitle: null_mut(),
+        nMaxFileTitle: 0,
+        lpstrInitialDir: null_mut(),
+        lpstrTitle: title_utf16.as_ptr(),
+        Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST,
+        nFileOffset: 0,
+        nFileExtension: 0,
+        lpstrDefExt: def_ext_utf16.as_ptr(),
+        lCustData: 0,
+        lpfnHook: None,
+        lpTemplateName: null_mut(),
+        pvReserved: null_mut(),
+        dwReserved: 0,
+        FlagsEx: 0,
+    };
+    
+    if GetSaveFileNameW(&mut ofn) != 0 {
+        let len = file_name.iter().position(|&c| c == 0).unwrap_or(file_name.len());
+        let path = String::from_utf16_lossy(&file_name[..len]);
+        Some(path)
+    } else {
+        None
+    }
+}
+
 // 计算保持宽高比的缩放尺寸
 fn calculate_scaled_size(img_width: i32, img_height: i32, window_width: i32, window_height: i32) -> (i32, i32, i32, i32) {
     let img_ratio = img_width as f64 / img_height as f64;
@@ -289,6 +375,29 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                         MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
                     }
                 }
+            }
+        }
+        MENU_SAVE_FILE => {
+            if let Some(ref mat) = state.current_mat {
+                if let Some(path) = show_save_file_dialog(hwnd) {
+                    match save_mat_with_unicode_path(mat, &path) {
+                        Ok(final_path) => {
+                            println!("✅ 已保存: {}", final_path);
+                        }
+                        Err(e) => {
+                            println!("❌ 保存失败: {}", e);
+                            let error_msg = format!("无法保存到:\n{}\n\n错误信息: {}", path, e);
+                            let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                            let title_utf16: Vec<u16> = "保存错误".encode_utf16().chain(std::iter::once(0)).collect();
+                            MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                        }
+                    }
+                }
+            } else {
+                let msg = "没有可保存的图像，请先进行处理或打开图像";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
             }
         }
         MENU_TO_GRAY => {
