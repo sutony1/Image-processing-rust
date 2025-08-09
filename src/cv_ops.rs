@@ -632,8 +632,15 @@ fn bgr_to_lab(_b: u8, _g: u8, _r: u8) -> Result<(u8, u8, u8)> {
     Ok((128, 128, 128)) // 返回中性值
 }
 
+/// 色块提取结果
+pub struct ColorExtractionResult {
+    pub color_blocks: Vec<ColorBlockInfo>,
+    pub grid_image: core::Mat,
+    pub color_palette: core::Mat,
+}
+
 /// 使用网格法从透视变换后的色卡图像中提取24个色块及其RGB值
-pub fn extract_color_blocks_grid(image: &core::Mat) -> Result<Vec<ColorBlockInfo>> {
+pub fn extract_color_blocks_grid(image: &core::Mat) -> Result<ColorExtractionResult> {
     println!("开始使用网格法提取色块...");
     
     // 保存原始图像用于调试
@@ -840,7 +847,8 @@ pub fn extract_color_blocks_grid(image: &core::Mat) -> Result<Vec<ColorBlockInfo
         )?;
     }
     
-    ocv_bridge::save_debug_image(&grid_img, "grid_04_grid_lines.png")?;
+    // 先不保存，等待用户交互后再保存
+    // ocv_bridge::save_debug_image(&grid_img, "grid_04_grid_lines.png")?;
     
     // 从每个色块中提取颜色样本
     let sample_size = std::cmp::min(block_width, block_height) / 3; // 采样区域大小
@@ -979,9 +987,14 @@ pub fn extract_color_blocks_grid(image: &core::Mat) -> Result<Vec<ColorBlockInfo
         )?;
     }
     
-    ocv_bridge::save_debug_image(&color_display, "grid_05_color_palette.png")?;
+    // 先不保存，等待用户交互后再保存
+    // ocv_bridge::save_debug_image(&color_display, "grid_05_color_palette.png")?;
     
     println!("✅ 成功提取了 {} 个色块", color_info.len());
     
-    Ok(color_info)
+    Ok(ColorExtractionResult {
+        color_blocks: color_info,
+        grid_image: grid_img,
+        color_palette: color_display,
+    })
 }

@@ -339,6 +339,21 @@ unsafe fn show_save_file_dialog(hwnd: HWND) -> Option<String> {
     }
 }
 
+// 显示带有"下一步"按钮的对话框
+unsafe fn show_next_step_dialog(hwnd: HWND, title: &str, message: &str) -> bool {
+    let title_utf16: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let message_utf16: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+    
+    let result = MessageBoxW(
+        hwnd,
+        message_utf16.as_ptr(),
+        title_utf16.as_ptr(),
+        MB_OKCANCEL | MB_ICONINFORMATION
+    );
+    
+    result == IDOK
+}
+
 // 计算保持宽高比的缩放尺寸
 fn calculate_scaled_size(img_width: i32, img_height: i32, window_width: i32, window_height: i32) -> (i32, i32, i32, i32) {
     let img_ratio = img_width as f64 / img_height as f64;
@@ -533,27 +548,62 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             if let Some(ref current) = state.current_mat.clone() {
                 println!("开始从当前显示的图像中提取色块颜色...");
                 match cv_ops::extract_color_blocks_grid(&current) {
-                    Ok(color_blocks) => {
-                        println!("✅ 成功提取了 {} 个色块", color_blocks.len());
+                    Ok(result) => {
+                        println!("✅ 成功提取了 {} 个色块", result.color_blocks.len());
                         
-                        // 显示提取结果的详细信息
-                        let mut result_msg = String::from("成功提取了24个色块的RGB值：\n\n");
-                        for (i, block) in color_blocks.iter().enumerate() {
-                            if i < 8 {  // 只显示前8个，避免消息框过长
-                                result_msg.push_str(&format!(
-                                    "色块{}: RGB({},{},{}) {}\n",
-                                    block.block_number, block.r, block.g, block.b, block.hex
-                                ));
+                        // 第一步：显示网格划分图像
+                        if let Ok(()) = state.update_display_from_mat(&result.grid_image) {
+                            InvalidateRect(hwnd, null_mut(), 1);
+                            
+                            // 显示"下一步"对话框
+                            if show_next_step_dialog(hwnd, "网格划分完成", 
+                                "已完成网格划分，当前显示的是网格线和色块编号。\n\n点击\"确定\"继续查看色卡参考图，或点击\"取消\"停止。") {
+                                
+                                // 保存网格图像
+                                if let Err(e) = ocv_bridge::save_debug_image(&result.grid_image, "grid_04_grid_lines.png") {
+                                    println!("保存网格图像失败: {}", e);
+                                }
+                                
+                                // 第二步：显示色卡参考图
+                                if let Ok(()) = state.update_display_from_mat(&result.color_palette) {
+                                    InvalidateRect(hwnd, null_mut(), 1);
+                                    
+                                    // 保存色卡参考图
+                                    if let Err(e) = ocv_bridge::save_debug_image(&result.color_palette, "grid_05_color_palette.png") {
+                                        println!("保存色卡参考图失败: {}", e);
+                                    }
+                                    
+                                    // 显示提取结果的详细信息
+                                    let mut result_msg = String::from("成功提取了24个色块的RGB值：\n\n");
+                                    for (i, block) in result.color_blocks.iter().enumerate() {
+                                        if i < 8 {  // 只显示前8个，避免消息框过长
+                                            result_msg.push_str(&format!(
+                                                "色块{}: RGB({},{},{}) {}\n",
+                                                block.block_number, block.r, block.g, block.b, block.hex
+                                            ));
+                                        }
+                                    }
+                                    if result.color_blocks.len() > 8 {
+                                        result_msg.push_str("...\n");
+                                    }
+                                    result_msg.push_str("\n详细信息已保存到调试输出目录\n当前显示的是24个色块的色卡参考图");
+                                    
+                                    let msg_utf16: Vec<u16> = result_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                    let title_utf16: Vec<u16> = "色块提取成功".encode_utf16().chain(std::iter::once(0)).collect();
+                                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                                } else {
+                                    println!("❌ 更新色卡参考图显示失败");
+                                }
+                            } else {
+                                println!("用户取消了色块提取过程");
+                                // 保存网格图像（即使用户取消也保存）
+                                if let Err(e) = ocv_bridge::save_debug_image(&result.grid_image, "grid_04_grid_lines.png") {
+                                    println!("保存网格图像失败: {}", e);
+                                }
                             }
+                        } else {
+                            println!("❌ 更新网格图像显示失败");
                         }
-                        if color_blocks.len() > 8 {
-                            result_msg.push_str("...\n");
-                        }
-                        result_msg.push_str("\n详细信息已保存到调试输出目录");
-                        
-                        let msg_utf16: Vec<u16> = result_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                        let title_utf16: Vec<u16> = "色块提取成功".encode_utf16().chain(std::iter::once(0)).collect();
-                        MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
                     }
                     Err(e) => {
                         println!("❌ 色块提取失败: {}", e);
