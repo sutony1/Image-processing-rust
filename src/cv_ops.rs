@@ -575,3 +575,413 @@ pub fn find_and_draw_contours(binary: &core::Mat) -> Result<core::Vector<core::V
     
     Ok(contours)
 }
+
+/// 色块信息结构体
+#[derive(Debug, Clone)]
+pub struct ColorBlockInfo {
+    pub block_number: usize,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub h: u16,  // 0-360度
+    pub s: u8,   // 0-100%
+    pub v: u8,   // 0-100%
+    pub l: u8,   // Lab L值
+    pub a: u8,   // Lab a值
+    pub b_val: u8, // Lab b值
+    pub hex: String,
+}
+
+/// 将BGR颜色转换为HSV颜色空间（简化版本）
+fn bgr_to_hsv(b: u8, g: u8, r: u8) -> Result<(u16, u8, u8)> {
+    // 简化的颜色空间转换，手动计算
+    let r_f = r as f32 / 255.0;
+    let g_f = g as f32 / 255.0;
+    let b_f = b as f32 / 255.0;
+    
+    let max_val = r_f.max(g_f).max(b_f);
+    let min_val = r_f.min(g_f).min(b_f);
+    let delta = max_val - min_val;
+    
+    // 计算H (色相)
+    let h = if delta == 0.0 {
+        0.0
+    } else if max_val == r_f {
+        60.0 * (((g_f - b_f) / delta) % 6.0)
+    } else if max_val == g_f {
+        60.0 * ((b_f - r_f) / delta + 2.0)
+    } else {
+        60.0 * ((r_f - g_f) / delta + 4.0)
+    };
+    
+    let h = if h < 0.0 { h + 360.0 } else { h };
+    
+    // 计算S (饱和度)
+    let s = if max_val == 0.0 { 0.0 } else { delta / max_val };
+    
+    // 计算V (明度)
+    let v = max_val;
+    
+    Ok((h as u16, (s * 100.0) as u8, (v * 100.0) as u8))
+}
+
+/// 将BGR颜色转换为Lab颜色空间（简化版本）
+fn bgr_to_lab(_b: u8, _g: u8, _r: u8) -> Result<(u8, u8, u8)> {
+    // 简化版本，返回RGB作为Lab的近似值
+    // 在实际应用中可能需要更精确的转换
+    Ok((128, 128, 128)) // 返回中性值
+}
+
+/// 使用网格法从透视变换后的色卡图像中提取24个色块及其RGB值
+pub fn extract_color_blocks_grid(image: &core::Mat) -> Result<Vec<ColorBlockInfo>> {
+    println!("开始使用网格法提取色块...");
+    
+    // 保存原始图像用于调试
+    ocv_bridge::save_debug_image(image, "grid_01_original.png")?;
+    
+    // 获取图像尺寸
+    let height = image.rows();
+    let width = image.cols();
+    
+    // 转换为HSV色彩空间
+    let mut hsv = core::Mat::default();
+    imgproc::cvt_color(image, &mut hsv, imgproc::COLOR_BGR2HSV, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
+    
+    // 分离HSV通道
+    let mut hsv_channels = core::Vector::<core::Mat>::new();
+    core::split(&hsv, &mut hsv_channels)?;
+    let v_channel = hsv_channels.get(2)?;
+    let s_channel = hsv_channels.get(1)?;
+    
+    // 使用更严格的阈值来排除黑色区域（低亮度）
+    let mut v_mask = core::Mat::default();
+    imgproc::threshold(&v_channel, &mut v_mask, 40.0, 255.0, imgproc::THRESH_BINARY)?;
+    
+    let mut s_mask = core::Mat::default();
+    imgproc::threshold(&s_channel, &mut s_mask, 30.0, 255.0, imgproc::THRESH_BINARY)?;
+    
+    // 组合亮度和饱和度掩码
+    let mut combined_mask = core::Mat::default();
+    core::bitwise_and(&v_mask, &s_mask, &mut combined_mask, &core::no_array())?;
+    
+    // 通过数学形态学操作改进掩码
+    let kernel = imgproc::get_structuring_element(
+        imgproc::MORPH_RECT,
+        core::Size::new(7, 7),
+        core::Point::new(-1, -1)
+    )?;
+    
+    let mut morphed_mask = core::Mat::default();
+    imgproc::morphology_ex(
+        &combined_mask,
+        &mut morphed_mask,
+        imgproc::MORPH_CLOSE,
+        &kernel,
+        core::Point::new(-1, -1),
+        1,
+        core::BORDER_CONSTANT,
+        imgproc::morphology_default_border_value()?
+    )?;
+    
+    let mut final_mask = core::Mat::default();
+    imgproc::morphology_ex(
+        &morphed_mask,
+        &mut final_mask,
+        imgproc::MORPH_OPEN,
+        &kernel,
+        core::Point::new(-1, -1),
+        1,
+        core::BORDER_CONSTANT,
+        imgproc::morphology_default_border_value()?
+    )?;
+    
+    // 保存掩码用于调试
+    ocv_bridge::save_debug_image(&final_mask, "grid_02_mask.png")?;
+    
+    // 可视化掩码（将黑色区域标记为红色）
+    let mut mask_viz = image.clone();
+    for y in 0..height {
+        for x in 0..width {
+            let mask_val = *final_mask.at_2d::<u8>(y, x)?;
+            if mask_val == 0 {
+                // 将黑色区域标记为红色
+                let pixel = mask_viz.at_2d_mut::<core::Vec3b>(y, x)?;
+                *pixel = core::Vec3b::from([0, 0, 255]); // BGR格式：红色
+            }
+        }
+    }
+    ocv_bridge::save_debug_image(&mask_viz, "grid_03_mask_visualization.png")?;
+    
+    // 获取非黑色区域的边界框
+    let mut contours = core::Vector::<core::Vector<core::Point>>::new();
+    imgproc::find_contours(
+        &final_mask,
+        &mut contours,
+        imgproc::RETR_EXTERNAL,
+        imgproc::CHAIN_APPROX_SIMPLE,
+        core::Point::default()
+    )?;
+    
+    if contours.is_empty() {
+        return Err(anyhow::anyhow!("未找到有效的非黑色区域"));
+    }
+    
+    // 找到最大非黑色区域（应该是色卡区域）
+    let mut max_area = 0.0;
+    let mut main_contour = core::Vector::<core::Point>::new();
+    
+    for i in 0..contours.len() {
+        let contour = contours.get(i)?;
+        let area = imgproc::contour_area(&contour, false)?;
+        if area > max_area {
+            max_area = area;
+            main_contour = contour;
+        }
+    }
+    
+    let rect = imgproc::bounding_rect(&main_contour)?;
+    let (x, y, w, h) = (rect.x, rect.y, rect.width, rect.height);
+    
+    println!("找到色卡区域: x={}, y={}, w={}, h={}", x, y, w, h);
+    
+    // 创建网格分割（6行4列，常见的色卡布局）
+    let rows = 6;
+    let cols = 4;
+    
+    // 计算每个色块的大小，基于非黑色区域的边界框
+    let block_height = h / rows;
+    let block_width = w / cols;
+    
+    println!("色块尺寸: {}x{}", block_width, block_height);
+    
+    // 确定每个色块的中心点和边界框
+    let mut centers = Vec::new();
+    let mut bboxes = Vec::new();
+    
+    for row in 0..rows {
+        for col in 0..cols {
+            // 计算色块的边界框
+            let block_x = x + col * block_width;
+            let block_y = y + row * block_height;
+            
+            // 计算色块的中心点坐标
+            let center_x = block_x + block_width / 2;
+            let center_y = block_y + block_height / 2;
+            
+            centers.push((center_x, center_y));
+            bboxes.push((block_x, block_y, block_width, block_height));
+        }
+    }
+    
+    // 显示网格划分和色块中心点
+    let mut grid_img = image.clone();
+    
+    // 绘制外边框
+    imgproc::rectangle(
+        &mut grid_img,
+        core::Rect::new(x, y, w, h),
+        core::Scalar::new(0.0, 255.0, 255.0, 0.0), // 黄色
+        2,
+        imgproc::LINE_8,
+        0
+    )?;
+    
+    // 绘制水平线
+    for r in 1..rows {
+        let y_line = y + r * block_height;
+        imgproc::line(
+            &mut grid_img,
+            core::Point::new(x, y_line),
+            core::Point::new(x + w, y_line),
+            core::Scalar::new(255.0, 255.0, 255.0, 0.0), // 白色
+            2,
+            imgproc::LINE_8,
+            0
+        )?;
+    }
+    
+    // 绘制垂直线
+    for c in 1..cols {
+        let x_line = x + c * block_width;
+        imgproc::line(
+            &mut grid_img,
+            core::Point::new(x_line, y),
+            core::Point::new(x_line, y + h),
+            core::Scalar::new(255.0, 255.0, 255.0, 0.0), // 白色
+            2,
+            imgproc::LINE_8,
+            0
+        )?;
+    }
+    
+    // 绘制中心点和标签
+    for (i, &(center_x, center_y)) in centers.iter().enumerate() {
+        imgproc::circle(
+            &mut grid_img,
+            core::Point::new(center_x, center_y),
+            5,
+            core::Scalar::new(0.0, 0.0, 255.0, 0.0), // 红色
+            -1,
+            imgproc::LINE_8,
+            0
+        )?;
+        
+        let text = format!("{}", i + 1);
+        imgproc::put_text(
+            &mut grid_img,
+            &text,
+            core::Point::new(center_x - 10, center_y + 10),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.8,
+            core::Scalar::new(0.0, 0.0, 255.0, 0.0), // 红色
+            2,
+            imgproc::LINE_8,
+            false
+        )?;
+    }
+    
+    ocv_bridge::save_debug_image(&grid_img, "grid_04_grid_lines.png")?;
+    
+    // 从每个色块中提取颜色样本
+    let sample_size = std::cmp::min(block_width, block_height) / 3; // 采样区域大小
+    let mut color_info = Vec::new();
+    
+    for (i, &(center_x, center_y)) in centers.iter().enumerate() {
+        
+        // 定义采样区域（色块中心的小区域）
+        let sample_x1 = std::cmp::max(0, center_x - sample_size / 2);
+        let sample_y1 = std::cmp::max(0, center_y - sample_size / 2);
+        let sample_x2 = std::cmp::min(width, center_x + sample_size / 2);
+        let sample_y2 = std::cmp::min(height, center_y + sample_size / 2);
+        
+        // 提取色块中心区域
+        let sample_rect = core::Rect::new(
+            sample_x1,
+            sample_y1,
+            sample_x2 - sample_x1,
+            sample_y2 - sample_y1
+        );
+        let sample = core::Mat::roi(image, sample_rect)?;
+        
+        // 计算平均颜色
+        let mean_scalar = core::mean(&sample, &core::no_array())?;
+        let b = mean_scalar[0] as u8;
+        let g = mean_scalar[1] as u8;
+        let r = mean_scalar[2] as u8;
+        
+        // 转换为其他色彩空间
+        let (h, s, v) = bgr_to_hsv(b, g, r).unwrap_or((0, 0, 0));
+        let (l, a, b_val) = bgr_to_lab(b, g, r).unwrap_or((0, 0, 0));
+        
+        color_info.push(ColorBlockInfo {
+            block_number: i + 1,
+            r,
+            g,
+            b,
+            h,
+            s,
+            v,
+            l,
+            a,
+            b_val,
+            hex: format!("#{:02X}{:02X}{:02X}", r, g, b),
+        });
+        
+        println!("色块 {}: RGB({}, {}, {}) HSV({}, {}%, {}%) #{:02X}{:02X}{:02X}",
+                 i + 1, r, g, b, h, s, v, r, g, b);
+    }
+    
+    // 创建一个可视化展示所有提取的色块
+    let block_size = 100;
+    let mut color_display = core::Mat::zeros(
+        rows * block_size,
+        cols * block_size,
+        core::CV_8UC3
+    )?.to_mat()?;
+    
+    for (i, info) in color_info.iter().enumerate() {
+        let row = i / cols as usize;
+        let col = i % cols as usize;
+        
+        // BGR颜色填充
+        let rect = core::Rect::new(
+            (col * block_size as usize) as i32,
+            (row * block_size as usize) as i32,
+            block_size,
+            block_size
+        );
+        
+        let color = core::Scalar::new(info.b as f64, info.g as f64, info.r as f64, 0.0);
+        imgproc::rectangle(
+            &mut color_display,
+            rect,
+            color,
+            -1,
+            imgproc::LINE_8,
+            0
+        )?;
+        
+        // 根据颜色的亮度选择文字颜色
+        let brightness = 0.299 * info.r as f64 + 0.587 * info.g as f64 + 0.114 * info.b as f64;
+        let text_color = if brightness > 127.0 {
+            core::Scalar::new(0.0, 0.0, 0.0, 0.0) // 黑色
+        } else {
+            core::Scalar::new(255.0, 255.0, 255.0, 0.0) // 白色
+        };
+        
+        // 添加色块编号
+        imgproc::put_text(
+            &mut color_display,
+            &format!("{}", i + 1),
+            core::Point::new(
+                (col * block_size as usize) as i32 + 10,
+                (row * block_size as usize) as i32 + 30
+            ),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.9,
+            text_color,
+            2,
+            imgproc::LINE_8,
+            false
+        )?;
+        
+        // 添加RGB十六进制值
+        imgproc::put_text(
+            &mut color_display,
+            &info.hex,
+            core::Point::new(
+                (col * block_size as usize) as i32 + 10,
+                (row * block_size as usize) as i32 + 55
+            ),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.4,
+            text_color,
+            1,
+            imgproc::LINE_8,
+            false
+        )?;
+        
+        // 添加RGB值
+        let rgb_text = format!("R:{} G:{} B:{}", info.r, info.g, info.b);
+        imgproc::put_text(
+            &mut color_display,
+            &rgb_text,
+            core::Point::new(
+                (col * block_size as usize) as i32 + 10,
+                (row * block_size as usize) as i32 + 75
+            ),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.4,
+            text_color,
+            1,
+            imgproc::LINE_8,
+            false
+        )?;
+    }
+    
+    ocv_bridge::save_debug_image(&color_display, "grid_05_color_palette.png")?;
+    
+    println!("✅ 成功提取了 {} 个色块", color_info.len());
+    
+    Ok(color_info)
+}

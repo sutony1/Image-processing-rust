@@ -23,8 +23,9 @@ const MENU_MORPH_CLOSE: u32 = 1005;
 const MENU_DILATE: u32 = 1006;
 const MENU_FIND_CONTOURS: u32 = 1007;
 const MENU_PERSPECTIVE_TRANSFORM: u32 = 1008;
-const MENU_RESTORE: u32 = 1009;
-const MENU_SAVE_FILE: u32 = 1010;
+const MENU_EXTRACT_COLOR_BLOCKS: u32 = 1009;
+const MENU_RESTORE: u32 = 1010;
+const MENU_SAVE_FILE: u32 = 1011;
 
 // 全局变量存储图像数据
 static mut IMAGE_STATE: Option<ImageState> = None;
@@ -225,6 +226,13 @@ unsafe fn create_menu() -> HMENU {
     let perspective_text = "透视变换(简化)(&P)";
     let perspective_utf16: Vec<u16> = perspective_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(process_menu, MF_STRING, MENU_PERSPECTIVE_TRANSFORM as usize, perspective_utf16.as_ptr());
+    
+    AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
+    
+    // 色卡分析
+    let extract_color_text = "读取色卡色块颜色(&E)";
+    let extract_color_utf16: Vec<u16> = extract_color_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(process_menu, MF_STRING, MENU_EXTRACT_COLOR_BLOCKS as usize, extract_color_utf16.as_ptr());
     
     AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
     
@@ -521,6 +529,47 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 }
             }
         }
+        MENU_EXTRACT_COLOR_BLOCKS => {
+            if let Some(ref current) = state.current_mat.clone() {
+                println!("开始从当前显示的图像中提取色块颜色...");
+                match cv_ops::extract_color_blocks_grid(&current) {
+                    Ok(color_blocks) => {
+                        println!("✅ 成功提取了 {} 个色块", color_blocks.len());
+                        
+                        // 显示提取结果的详细信息
+                        let mut result_msg = String::from("成功提取了24个色块的RGB值：\n\n");
+                        for (i, block) in color_blocks.iter().enumerate() {
+                            if i < 8 {  // 只显示前8个，避免消息框过长
+                                result_msg.push_str(&format!(
+                                    "色块{}: RGB({},{},{}) {}\n",
+                                    block.block_number, block.r, block.g, block.b, block.hex
+                                ));
+                            }
+                        }
+                        if color_blocks.len() > 8 {
+                            result_msg.push_str("...\n");
+                        }
+                        result_msg.push_str("\n详细信息已保存到调试输出目录");
+                        
+                        let msg_utf16: Vec<u16> = result_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                        let title_utf16: Vec<u16> = "色块提取成功".encode_utf16().chain(std::iter::once(0)).collect();
+                        MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                    }
+                    Err(e) => {
+                        println!("❌ 色块提取失败: {}", e);
+                        let error_msg = format!("色块提取失败：\n{}\n\n请确保当前显示的是经过透视变换的色卡图像", e);
+                        let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                        let title_utf16: Vec<u16> = "色块提取失败".encode_utf16().chain(std::iter::once(0)).collect();
+                        MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                    }
+                }
+            } else {
+                let msg = "没有可用的图像，请先加载图像并进行透视变换";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            }
+        }
         MENU_RESTORE => {
             if let Some(ref original) = state.original_bgr.clone() {
                 if let Ok(()) = state.update_display_from_mat(&original) {
@@ -750,6 +799,7 @@ fn main() {
         println!("   - 膨胀操作");
         println!("   - 轮廓检测");
         println!("   - 透视变换(简化色卡检测)");
+        println!("   - 读取色卡色块颜色(网格法提取24个色块RGB值)");
         println!("🐛 调试图像会保存到 ./debug_out/ 目录");
 
         // 消息循环
