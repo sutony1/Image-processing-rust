@@ -24,8 +24,9 @@ const MENU_DILATE: u32 = 1006;
 const MENU_FIND_CONTOURS: u32 = 1007;
 const MENU_PERSPECTIVE_TRANSFORM: u32 = 1008;
 const MENU_EXTRACT_COLOR_BLOCKS: u32 = 1009;
-const MENU_RESTORE: u32 = 1010;
-const MENU_SAVE_FILE: u32 = 1011;
+const MENU_TEMPLATE_MATCHING: u32 = 1010;
+const MENU_RESTORE: u32 = 1011;
+const MENU_SAVE_FILE: u32 = 1012;
 
 // 全局变量存储图像数据
 static mut IMAGE_STATE: Option<ImageState> = None;
@@ -230,6 +231,10 @@ unsafe fn create_menu() -> HMENU {
     AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
     
     // 色卡分析
+    let template_match_text = "模板匹配定位色卡(&T)";
+    let template_match_utf16: Vec<u16> = template_match_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(process_menu, MF_STRING, MENU_TEMPLATE_MATCHING as usize, template_match_utf16.as_ptr());
+    
     let extract_color_text = "读取色卡色块颜色(&E)";
     let extract_color_utf16: Vec<u16> = extract_color_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(process_menu, MF_STRING, MENU_EXTRACT_COLOR_BLOCKS as usize, extract_color_utf16.as_ptr());
@@ -424,8 +429,8 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             }
         }
         MENU_TO_GRAY => {
-            if let Some(ref original) = state.original_bgr.clone() {
-                match cv_ops::to_gray(&original) {
+            if let Some(ref current) = state.current_mat.clone() {
+                match cv_ops::to_gray(&current) {
                     Ok(gray) => {
                         if let Ok(()) = state.update_display_from_mat(&gray) {
                             println!("✅ 灰度转换完成");
@@ -437,8 +442,8 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             }
         }
         MENU_GAUSSIAN => {
-            if let Some(ref original) = state.original_bgr.clone() {
-                match cv_ops::to_gray(&original).and_then(|gray| cv_ops::gaussian(&gray, 5, 2.0)) {
+            if let Some(ref current) = state.current_mat.clone() {
+                match cv_ops::to_gray(&current).and_then(|gray| cv_ops::gaussian(&gray, 5, 2.0)) {
                     Ok(blurred) => {
                         if let Ok(()) = state.update_display_from_mat(&blurred) {
                             println!("✅ 高斯模糊完成");
@@ -450,8 +455,8 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             }
         }
         MENU_CANNY => {
-            if let Some(ref original) = state.original_bgr.clone() {
-                match cv_ops::to_gray(&original)
+            if let Some(ref current) = state.current_mat.clone() {
+                match cv_ops::to_gray(&current)
                     .and_then(|gray| cv_ops::gaussian(&gray, 5, 0.0))
                     .and_then(|blurred| cv_ops::canny(&blurred, 50.0, 150.0)) {
                     Ok(edges) => {
@@ -465,8 +470,8 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             }
         }
         MENU_ADAPTIVE_THRESHOLD => {
-            if let Some(ref original) = state.original_bgr.clone() {
-                match cv_ops::to_gray(&original)
+            if let Some(ref current) = state.current_mat.clone() {
+                match cv_ops::to_gray(&current)
                     .and_then(|gray| cv_ops::adaptive_threshold(&gray, 255.0, 11, 2.0)) {
                     Ok(binary) => {
                         if let Ok(()) = state.update_display_from_mat(&binary) {
@@ -479,8 +484,8 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             }
         }
         MENU_MORPH_CLOSE => {
-            if let Some(ref original) = state.original_bgr.clone() {
-                match cv_ops::to_gray(&original)
+            if let Some(ref current) = state.current_mat.clone() {
+                match cv_ops::to_gray(&current)
                     .and_then(|gray| cv_ops::adaptive_threshold(&gray, 255.0, 11, 2.0))
                     .and_then(|binary| cv_ops::morph_close(&binary, 3)) {
                     Ok(closed) => {
@@ -494,8 +499,8 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             }
         }
         MENU_DILATE => {
-            if let Some(ref original) = state.original_bgr.clone() {
-                match cv_ops::to_gray(&original)
+            if let Some(ref current) = state.current_mat.clone() {
+                match cv_ops::to_gray(&current)
                     .and_then(|gray| cv_ops::adaptive_threshold(&gray, 255.0, 11, 2.0))
                     .and_then(|binary| cv_ops::dilate(&binary, 3, 1)) {
                     Ok(dilated) => {
@@ -509,8 +514,8 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             }
         }
         MENU_FIND_CONTOURS => {
-            if let Some(ref original) = state.original_bgr.clone() {
-                match cv_ops::to_gray(&original)
+            if let Some(ref current) = state.current_mat.clone() {
+                match cv_ops::to_gray(&current)
                     .and_then(|gray| cv_ops::adaptive_threshold(&gray, 255.0, 11, 2.0))
                     .and_then(|binary| cv_ops::find_and_draw_contours(&binary)) {
                     Ok(contours) => {
@@ -522,9 +527,9 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             }
         }
         MENU_PERSPECTIVE_TRANSFORM => {
-            if let Some(ref original) = state.original_bgr.clone() {
+            if let Some(ref current) = state.current_mat.clone() {
                 println!("开始简化透视变换...");
-                match cv_ops::perspective_transform_simplified(&original) {
+                match cv_ops::perspective_transform_simplified(&current) {
                     Ok(Some(transformed)) => {
                         if let Ok(()) = state.update_display_from_mat(&transformed) {
                             println!("✅ 简化透视变换完成");
@@ -542,6 +547,95 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                         println!("❌ 透视变换出错: {}", e);
                     }
                 }
+            }
+        }
+        MENU_TEMPLATE_MATCHING => {
+            if let Some(ref scene) = state.current_mat.clone() {
+                println!("开始模板匹配定位色卡...");
+                
+                let msg = "模板匹配色卡检测：\n\n当前显示的图像将作为场景图像（包含色卡的照片）\n现在请选择标准色卡模板图像进行匹配";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "选择色卡模板".encode_utf16().chain(std::iter::once(0)).collect();
+                
+                if MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OKCANCEL | MB_ICONINFORMATION) == IDOK {
+                    if let Some(template_path) = show_open_file_dialog(hwnd) {
+                        println!("模板图像: {}", template_path);
+                        println!("场景图像: 当前显示的图像");
+                        
+                        match cv_ops::match_and_transform_color_card(&template_path, &scene) {
+                            Ok(result) => {
+                                // 第一步：显示检测结果（带绿色框的原图）
+                                if let Some(ref detection_img) = result.scene_with_detection {
+                                    if let Ok(()) = state.update_display_from_mat(detection_img) {
+                                        println!("✅ 模板匹配定位色卡完成，匹配度: {:.1}%", result.match_confidence * 100.0);
+                                        InvalidateRect(hwnd, null_mut(), 1);
+                                        
+                                        // 显示确认对话框，询问是否要裁剪色卡
+                                        let confirm_msg = format!(
+                                            "色卡检测成功！\n\n匹配置信度: {:.1}%\n\n当前显示的是标注了色卡位置的原图像。\n绿色框和彩色角点标出了检测到的色卡位置。\n\n是否要裁剪出色卡区域进行颜色分析？",
+                                            result.match_confidence * 100.0
+                                        );
+                                        let confirm_msg_utf16: Vec<u16> = confirm_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                        let confirm_title_utf16: Vec<u16> = "色卡检测成功".encode_utf16().chain(std::iter::once(0)).collect();
+                                        
+                                        let user_choice = MessageBoxW(
+                                            hwnd, 
+                                            confirm_msg_utf16.as_ptr(), 
+                                            confirm_title_utf16.as_ptr(), 
+                                            MB_YESNO | MB_ICONQUESTION
+                                        );
+                                        
+                                        if user_choice == IDYES {
+                                            // 第二步：用户选择"是"，显示裁剪后色卡并更新current_mat
+                                            if let Some(ref warped) = result.warped_image {
+                                                // 更新显示并同时更新current_mat为裁剪后的图像
+                                                state.current_mat = Some(warped.clone());
+                                                if let Ok(()) = state.update_display_from_mat(warped) {
+                                                    InvalidateRect(hwnd, null_mut(), 1);
+                                                    
+                                                    let success_msg = "色卡裁剪完成！\n\n当前显示的是模板匹配透视变换后的色卡图像。\n调试图像已保存到debug_out目录。\n\n✅ 重要提示：当前工作图像已切换为裁剪后的色卡\n后续的所有图像处理操作都将基于这张裁剪后的色卡进行。\n\n您现在可以使用\"读取色卡色块颜色\"功能提取颜色信息。";
+                                                    let success_msg_utf16: Vec<u16> = success_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                                    let success_title_utf16: Vec<u16> = "裁剪成功".encode_utf16().chain(std::iter::once(0)).collect();
+                                                    MessageBoxW(hwnd, success_msg_utf16.as_ptr(), success_title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                                                    
+                                                    println!("✅ 工作图像已更新为裁剪后的色卡 ({}x{})", warped.cols(), warped.rows());
+                                                } else {
+                                                    println!("❌ 更新裁剪后的色卡图像显示失败");
+                                                }
+                                            } else {
+                                                println!("❌ 模板匹配结果中没有裁剪后的图像");
+                                                let error_msg = "内部错误：模板匹配成功但没有生成裁剪后的图像。";
+                                                let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                                let error_title_utf16: Vec<u16> = "内部错误".encode_utf16().chain(std::iter::once(0)).collect();
+                                                MessageBoxW(hwnd, error_msg_utf16.as_ptr(), error_title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                                            }
+                                        } else {
+                                            // 用户选择"否"，保持当前的检测结果显示
+                                            let keep_msg = "保持当前显示。\n\n如果需要裁剪色卡，请重新运行\"模板匹配定位色卡\"功能。";
+                                            let keep_msg_utf16: Vec<u16> = keep_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                            let keep_title_utf16: Vec<u16> = "已取消裁剪".encode_utf16().chain(std::iter::once(0)).collect();
+                                            MessageBoxW(hwnd, keep_msg_utf16.as_ptr(), keep_title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                                        }
+                                    }
+                                } else {
+                                    println!("❌ 检测结果图像为空");
+                                }
+                            }
+                            Err(e) => {
+                                println!("❌ 模板匹配出错: {}", e);
+                                let error_msg = format!("模板匹配过程中发生错误：\n{}\n\n请检查：\n1. 模板图像文件是否可读\n2. 图像格式是否支持\n3. OpenCV功能是否正常", e);
+                                let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                let error_title_utf16: Vec<u16> = "处理错误".encode_utf16().chain(std::iter::once(0)).collect();
+                                MessageBoxW(hwnd, error_msg_utf16.as_ptr(), error_title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                            }
+                        }
+                    }
+                }
+            } else {
+                let msg = "没有可用的场景图像。\n\n请先打开一张包含色卡的照片作为场景图像，然后再使用模板匹配功能。";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
             }
         }
         MENU_EXTRACT_COLOR_BLOCKS => {
@@ -849,6 +943,7 @@ fn main() {
         println!("   - 膨胀操作");
         println!("   - 轮廓检测");
         println!("   - 透视变换(简化色卡检测)");
+        println!("   - 模板匹配定位色卡(基于特征匹配SIFT/AKAZE/ORB)");
         println!("   - 读取色卡色块颜色(网格法提取24个色块RGB值)");
         println!("🐛 调试图像会保存到 ./debug_out/ 目录");
 

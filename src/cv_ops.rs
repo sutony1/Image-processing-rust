@@ -1,5 +1,5 @@
 use opencv::prelude::*;
-use opencv::{core, imgproc};
+use opencv::{core, imgproc, imgcodecs};
 use anyhow::Result;
 use crate::ocv_bridge;
 
@@ -997,4 +997,241 @@ pub fn extract_color_blocks_grid(image: &core::Mat) -> Result<ColorExtractionRes
         grid_image: grid_img,
         color_palette: color_display,
     })
+}
+
+// ========== 色卡匹配算法 (基于模板匹配) ==========
+
+/// 色卡匹配结果
+pub struct ColorCardMatchResult {
+    pub homography: Option<core::Mat>,
+    pub template_corners: [core::Point2f; 4],
+    pub projected_corners: Option<[core::Point2f; 4]>,
+    pub warped_image: Option<core::Mat>,
+    pub scene_with_detection: Option<core::Mat>,  // 标注了检测结果的原场景图像
+    pub match_confidence: f64,
+}
+
+/// 使用模板匹配进行色卡检测和透视变换
+pub fn detect_color_card_with_template_matching(
+    template: &core::Mat,
+    scene: &core::Mat
+) -> Result<ColorCardMatchResult> {
+    println!("开始基于模板匹配的色卡检测...");
+    
+    // 保存输入图像用于调试
+    ocv_bridge::save_debug_image(template, "template_01_template.png")?;
+    ocv_bridge::save_debug_image(scene, "template_02_scene.png")?;
+    
+    // 转换为灰度图
+    let template_gray = to_gray(template)?;
+    let scene_gray = to_gray(scene)?;
+    
+    // 进行模板匹配
+    let mut result_mat = core::Mat::default();
+    imgproc::match_template(&scene_gray, &template_gray, &mut result_mat, imgproc::TM_CCOEFF_NORMED, &core::no_array())?;
+    
+    // 找到最佳匹配位置
+    let mut min_val = 0.0;
+    let mut max_val = 0.0;
+    let mut min_loc = core::Point::default();
+    let mut max_loc = core::Point::default();
+    
+    core::min_max_loc(&result_mat, Some(&mut min_val), Some(&mut max_val), Some(&mut min_loc), Some(&mut max_loc), &core::no_array())?;
+    
+    println!("模板匹配最佳匹配度: {:.3}", max_val);
+    
+    if max_val < 0.3 {
+        return Err(anyhow::anyhow!("模板匹配度太低: {:.3}", max_val));
+    }
+    
+    // 计算匹配区域
+    let template_width = template.cols();
+    let template_height = template.rows();
+    
+    let match_rect = core::Rect::new(
+        max_loc.x,
+        max_loc.y,
+        template_width,
+        template_height
+    );
+    
+    // 绘制匹配区域 - 创建带检测框的场景图像
+    let mut scene_with_detection = scene.clone();
+    
+    // 绘制绿色矩形框
+    imgproc::rectangle(
+        &mut scene_with_detection,
+        match_rect,
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0), // 绿色
+        4,
+        imgproc::LINE_8,
+        0
+    )?;
+    
+    // 在四个角点绘制圆点和标号
+    let corners = [
+        core::Point::new(max_loc.x, max_loc.y),                                    // 左上
+        core::Point::new(max_loc.x + template_width, max_loc.y),                   // 右上
+        core::Point::new(max_loc.x + template_width, max_loc.y + template_height), // 右下
+        core::Point::new(max_loc.x, max_loc.y + template_height),                  // 左下
+    ];
+    
+    let colors = [
+        core::Scalar::new(255.0, 0.0, 0.0, 0.0),   // 蓝色
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0),   // 绿色
+        core::Scalar::new(0.0, 0.0, 255.0, 0.0),   // 红色
+        core::Scalar::new(255.0, 255.0, 0.0, 0.0), // 青色
+    ];
+    
+    for (i, &corner) in corners.iter().enumerate() {
+        // 绘制圆点
+        imgproc::circle(
+            &mut scene_with_detection,
+            corner,
+            8,
+            colors[i],
+            -1,
+            imgproc::LINE_8,
+            0
+        )?;
+        
+        // 绘制标号
+        let text = format!("{}", i + 1);
+        imgproc::put_text(
+            &mut scene_with_detection,
+            &text,
+            core::Point::new(corner.x + 12, corner.y - 12),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.8,
+            core::Scalar::new(255.0, 255.0, 255.0, 0.0), // 白色
+            2,
+            imgproc::LINE_8,
+            false
+        )?;
+    }
+    
+    // 添加匹配置信度文本
+    let confidence_text = format!("Match: {:.1}%", max_val * 100.0);
+    imgproc::put_text(
+        &mut scene_with_detection,
+        &confidence_text,
+        core::Point::new(max_loc.x, max_loc.y - 20),
+        imgproc::FONT_HERSHEY_SIMPLEX,
+        0.7,
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0), // 绿色
+        2,
+        imgproc::LINE_8,
+        false
+    )?;
+    
+    ocv_bridge::save_debug_image(&scene_with_detection, "template_03_match_result.png")?;
+    
+    // 定义四个角点
+    let template_corners = get_template_corners(template)?;
+    let projected_corners = [
+        core::Point2f::new(max_loc.x as f32, max_loc.y as f32),
+        core::Point2f::new((max_loc.x + template_width) as f32, max_loc.y as f32),
+        core::Point2f::new((max_loc.x + template_width) as f32, (max_loc.y + template_height) as f32),
+        core::Point2f::new(max_loc.x as f32, (max_loc.y + template_height) as f32),
+    ];
+    
+    // 创建透视变换矩阵
+    let mut src_pts = core::Vector::<core::Point2f>::new();
+    let mut dst_pts = core::Vector::<core::Point2f>::new();
+    
+    for &corner in &projected_corners {
+        src_pts.push(corner);
+    }
+    
+    for &corner in &template_corners {
+        dst_pts.push(corner);
+    }
+    
+    let transform_matrix = imgproc::get_perspective_transform(&src_pts, &dst_pts, core::DECOMP_LU)?;
+    
+    // 进行透视变换
+    let mut warped_img = core::Mat::default();
+    imgproc::warp_perspective(
+        scene,
+        &mut warped_img,
+        &transform_matrix,
+        core::Size::new(template.cols(), template.rows()),
+        imgproc::INTER_LINEAR,
+        core::BORDER_CONSTANT,
+        core::Scalar::default()
+    )?;
+    
+    ocv_bridge::save_debug_image(&warped_img, "template_04_warped.png")?;
+    
+    Ok(ColorCardMatchResult {
+        homography: Some(transform_matrix),
+        template_corners,
+        projected_corners: Some(projected_corners),
+        warped_image: Some(warped_img),
+        scene_with_detection: Some(scene_with_detection),
+        match_confidence: max_val,
+    })
+}
+
+/// 获取模板图像的四个角点
+fn get_template_corners(template: &core::Mat) -> Result<[core::Point2f; 4]> {
+    let h = template.rows() as f32;
+    let w = template.cols() as f32;
+    
+    Ok([
+        core::Point2f::new(0.0, 0.0),           // 左上
+        core::Point2f::new(w - 1.0, 0.0),       // 右上
+        core::Point2f::new(w - 1.0, h - 1.0),   // 右下
+        core::Point2f::new(0.0, h - 1.0),       // 左下
+    ])
+}
+
+/// 简化接口：返回完整的匹配结果
+pub fn match_and_transform_color_card(
+    template_path: &str,
+    scene: &core::Mat
+) -> Result<ColorCardMatchResult> {
+    println!("加载模板图像: {}", template_path);
+    
+    // 先尝试直接读取
+    let template = imgcodecs::imread(template_path, imgcodecs::IMREAD_COLOR)?;
+    
+    let template = if template.empty() {
+        // 如果OpenCV直接读取失败，尝试使用备用方法
+        println!("OpenCV直接读取模板图像失败，尝试备用方法...");
+        
+        // 使用标准库读取文件到内存
+        let image_data = std::fs::read(template_path)
+            .map_err(|e| anyhow::anyhow!("无法读取模板图像文件到内存: {}", e))?;
+        
+        // 使用OpenCV从内存数据解码图像
+        let data_vec = core::Vector::from_slice(&image_data);
+        let decoded = imgcodecs::imdecode(&data_vec, imgcodecs::IMREAD_COLOR)
+            .map_err(|e| anyhow::anyhow!("无法解码模板图像数据: {}", e))?;
+        
+        if decoded.empty() {
+            return Err(anyhow::anyhow!("解码后的模板图像为空，可能是不支持的格式"));
+        }
+        
+        println!("模板图像加载成功（备用方法）");
+        decoded
+    } else {
+        println!("模板图像加载成功（直接方法）");
+        template
+    };
+    
+    let result = detect_color_card_with_template_matching(&template, scene)?;
+    
+    println!("匹配结果:");
+    println!("  匹配置信度: {:.3}", result.match_confidence);
+    
+    Ok(result)
+}
+
+/// 简化接口：使用现有的Mat对象进行色卡匹配
+pub fn match_color_card_from_mats(
+    template: &core::Mat,
+    scene: &core::Mat
+) -> Result<ColorCardMatchResult> {
+    detect_color_card_with_template_matching(template, scene)
 }
