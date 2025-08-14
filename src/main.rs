@@ -12,6 +12,7 @@ use anyhow::{Result, Context};
 
 mod ocv_bridge;
 mod cv_ops;
+mod sam_integration;
 
 // 菜单项ID常量
 const MENU_OPEN_FILE: u32 = 1000;
@@ -27,6 +28,9 @@ const MENU_EXTRACT_COLOR_BLOCKS: u32 = 1009;
 const MENU_TEMPLATE_MATCHING: u32 = 1010;
 const MENU_RESTORE: u32 = 1011;
 const MENU_SAVE_FILE: u32 = 1012;
+// 添加SAM相关菜单项
+const MENU_SAM_ENCODE: u32 = 1013;
+const MENU_SAM_SEGMENT: u32 = 1014;
 
 // 全局变量存储图像数据
 static mut IMAGE_STATE: Option<ImageState> = None;
@@ -37,6 +41,10 @@ struct ImageState {
     display_pixels: Vec<u8>,
     current_width: i32,
     current_height: i32,
+    sam_processor: Option<sam_integration::SAMProcessor>, // 新增
+    selecting: bool,
+    select_start: Option<(i32,i32)>,
+    select_end: Option<(i32,i32)>,
 }
 
 impl ImageState {
@@ -47,6 +55,10 @@ impl ImageState {
             display_pixels: Vec::new(),
             current_width: 0,
             current_height: 0,
+            sam_processor: None, // 新增
+            selecting: false,
+            select_start: None,
+            select_end: None,
         }
     }
     
@@ -134,6 +146,14 @@ impl ImageState {
     
     fn has_image(&self) -> bool {
         self.original_bgr.is_some()
+    }
+
+    fn init_sam_processor(&mut self) -> Result<()> {
+        if self.sam_processor.is_none() {
+            self.sam_processor = Some(sam_integration::SAMProcessor::new()?);
+            println!("✅ SAM处理器初始化成功");
+        }
+        Ok(())
     }
 }
 
@@ -254,6 +274,20 @@ unsafe fn create_menu() -> HMENU {
     let process_text = "处理(&P)";
     let process_utf16: Vec<u16> = process_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(menu_bar, MF_POPUP, process_menu as usize, process_utf16.as_ptr());
+    
+    // 添加SAM菜单
+    let sam_menu = CreatePopupMenu();
+    let sam_encode_text = "SAM编码图像(&E)";
+    let sam_encode_utf16: Vec<u16> = sam_encode_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(sam_menu, MF_STRING, MENU_SAM_ENCODE as usize, sam_encode_utf16.as_ptr());
+    
+    let sam_segment_text = "SAM交互分割(&S)";
+    let sam_segment_utf16: Vec<u16> = sam_segment_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(sam_menu, MF_STRING, MENU_SAM_SEGMENT as usize, sam_segment_utf16.as_ptr());
+    
+    let sam_text = "SAM分割(&S)";
+    let sam_utf16: Vec<u16> = sam_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(menu_bar, MF_POPUP, sam_menu as usize, sam_utf16.as_ptr());
     
     menu_bar
 }
@@ -381,6 +415,53 @@ fn calculate_scaled_size(img_width: i32, img_height: i32, window_width: i32, win
     let y = (window_height - scaled_height) / 2;
     
     (x, y, scaled_width, scaled_height)
+}
+
+// 将窗口坐标映射到图像坐标
+unsafe fn window_to_image_coords(hwnd: HWND, img_w: i32, img_h: i32, win_x: i32, win_y: i32) -> Option<(i32,i32)> {
+    let mut rect: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rect);
+    let window_width = rect.right - rect.left;
+    let window_height = rect.bottom - rect.top;
+    let (x0, y0, scaled_w, scaled_h) = calculate_scaled_size(img_w, img_h, window_width, window_height);
+    if win_x < x0 || win_y < y0 || win_x >= x0 + scaled_w || win_y >= y0 + scaled_h {
+        return None;
+    }
+    let rel_x = win_x - x0;
+    let rel_y = win_y - y0;
+    if scaled_w <= 0 || scaled_h <= 0 { return None; }
+    let img_x = (rel_x as i64 * img_w as i64 / scaled_w as i64) as i32;
+    let img_y = (rel_y as i64 * img_h as i64 / scaled_h as i64) as i32;
+    Some((img_x.clamp(0, img_w-1), img_y.clamp(0, img_h-1)))
+}
+
+fn overlay_mask_on_current(state: &mut ImageState, mask: &[u8], mask_w: i32, mask_h: i32) -> Result<()> {
+    use opencv::{imgproc, core as cvcore};
+    let current = state.current_mat.as_ref().unwrap();
+    let mut result = current.try_clone()?;
+
+    let mut mask_mat = cvcore::Mat::new_rows_cols_with_default(mask_h, mask_w, cvcore::CV_8UC1, cvcore::Scalar::all(0.0))?;
+    unsafe {
+        let total = (mask_w * mask_h) as usize;
+        std::ptr::copy_nonoverlapping(mask.as_ptr(), mask_mat.data_mut() as *mut u8, total);
+    }
+    let mut mask_resized = cvcore::Mat::default();
+    imgproc::resize(&mask_mat, &mut mask_resized, cvcore::Size{ width: state.current_width, height: state.current_height }, 0.0, 0.0, imgproc::INTER_NEAREST)?;
+
+    // 将0/1转换为0/255
+    let mut mask_bin = cvcore::Mat::default();
+    mask_resized.convert_to(&mut mask_bin, cvcore::CV_8UC1, 255.0, 0.0)?;
+
+    // 生成纯色覆盖图
+    let mut color_overlay = cvcore::Mat::new_rows_cols_with_default(state.current_height, state.current_width, cvcore::CV_8UC3, cvcore::Scalar::new(0.0, 255.0, 0.0, 0.0))?; // 绿色
+    let mut blended = cvcore::Mat::default();
+    cvcore::add_weighted(&color_overlay, 0.4, current, 0.6, 0.0, &mut blended, -1)?;
+
+    // 仅在mask区域复制混合结果
+    blended.copy_to_masked(&mut result, &mask_bin)?;
+
+    state.update_display_from_mat(&result)?;
+    Ok(())
 }
 
 // 处理菜单命令
@@ -722,6 +803,128 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 }
             }
         }
+        MENU_SAM_ENCODE => {
+            if let Some(ref current) = state.current_mat.clone() {
+                match state.init_sam_processor() {
+                    Ok(()) => {
+                        if let Some(ref mut sam) = state.sam_processor {
+                            match sam.encode_image(current) {
+                                Ok(()) => {
+                                    println!("✅ SAM图像编码完成");
+                                    let msg = "SAM图像编码完成！\n\n现在可以使用\"SAM交互分割\"功能，在图像上拖拽框选目标。";
+                                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                    let title_utf16: Vec<u16> = "编码成功".encode_utf16().chain(std::iter::once(0)).collect();
+                                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                                }
+                                Err(e) => {
+                                    println!("❌ SAM编码失败: {}", e);
+                                    let error_msg = format!("SAM编码失败：\n{}", e);
+                                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                    let title_utf16: Vec<u16> = "编码失败".encode_utf16().chain(std::iter::once(0)).collect();
+                                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("❌ SAM处理器初始化失败: {}", e);
+                        let error_msg = format!("SAM处理器初始化失败：\n{}\n\n请确保ONNX模型文件可用", e);
+                        let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                        let title_utf16: Vec<u16> = "初始化失败".encode_utf16().chain(std::iter::once(0)).collect();
+                        MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                    }
+                }
+            } else {
+                let msg = "没有可用的图像，请先加载图像";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        MENU_SAM_SEGMENT => {
+            if let Some(ref sam) = state.sam_processor {
+                if !sam.is_encoded() {
+                    let msg = "请先使用\"SAM编码图像\"功能对当前图像进行编码";
+                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                    return;
+                }
+            } else {
+                let msg = "SAM处理器未初始化，请先执行\"SAM编码图像\"";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                return;
+            }
+            state.selecting = true;
+            state.select_start = None;
+            state.select_end = None;
+            println!("🖱️ SAM交互分割：请在图像上按下并拖拽以框选目标，释放鼠标完成框选");
+        }
+        MENU_SAM_ENCODE => {
+            if let Some(ref current) = state.current_mat.clone() {
+                match state.init_sam_processor() {
+                    Ok(()) => {
+                        if let Some(ref mut sam) = state.sam_processor {
+                            match sam.encode_image(current) {
+                                Ok(()) => {
+                                    println!("✅ SAM图像编码完成");
+                                    let msg = "SAM图像编码完成！\n\n现在可以使用\"SAM交互分割\"功能进行对象分割。";
+                                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                    let title_utf16: Vec<u16> = "编码成功".encode_utf16().chain(std::iter::once(0)).collect();
+                                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                                }
+                                Err(e) => {
+                                    println!("❌ SAM编码失败: {}", e);
+                                    let error_msg = format!("SAM编码失败：\n{}", e);
+                                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                    let title_utf16: Vec<u16> = "编码失败".encode_utf16().chain(std::iter::once(0)).collect();
+                                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("❌ SAM处理器初始化失败: {}", e);
+                        let error_msg = format!("SAM处理器初始化失败：\n{}\n\n请确保ONNX模型文件存在", e);
+                        let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                        let title_utf16: Vec<u16> = "初始化失败".encode_utf16().chain(std::iter::once(0)).collect();
+                        MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                    }
+                }
+            } else {
+                let msg = "没有可用的图像，请先加载图像";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        
+        MENU_SAM_SEGMENT => {
+            if let Some(ref sam) = state.sam_processor {
+                if !sam.is_encoded() {
+                    let msg = "请先使用\"SAM编码图像\"功能对当前图像进行编码";
+                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                    return;
+                }
+                
+                // 这里可以实现交互式分割界面
+                // 暂时显示提示信息
+                let msg = "SAM交互分割功能\n\n请点击图像上的两个点来定义边界框，\n系统将自动分割框内的对象。\n\n注意：此功能需要鼠标事件支持，\n当前版本为演示版本。";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "SAM分割".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            } else {
+                let msg = "SAM处理器未初始化，请先使用\"SAM编码图像\"功能";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        
         _ => {}
     }
 }
@@ -743,6 +946,74 @@ unsafe extern "system" fn window_proc(
             handle_menu_command(hwnd, command_id);
             0
         }
+		WM_ERASEBKGND => {
+			// 我们自己进行背景清除与双缓冲绘制，阻止系统擦除背景以减少闪烁
+			1
+		}
+        WM_LBUTTONDOWN => {
+            let state = IMAGE_STATE.as_mut().unwrap();
+            if state.selecting && state.has_image() {
+                let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
+                let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+                if let Some((ix, iy)) = window_to_image_coords(hwnd, state.current_width, state.current_height, mx, my) {
+                    state.select_start = Some((ix, iy));
+                    state.select_end = Some((ix, iy));
+                    InvalidateRect(hwnd, null_mut(), 1);
+                }
+            }
+            0
+        }
+        WM_MOUSEMOVE => {
+            if (wparam & MK_LBUTTON as usize) != 0 {
+                let state = IMAGE_STATE.as_mut().unwrap();
+                if state.selecting && state.has_image() {
+                    let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
+                    let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+                    if let Some((ix, iy)) = window_to_image_coords(hwnd, state.current_width, state.current_height, mx, my) {
+                        state.select_end = Some((ix, iy));
+                        InvalidateRect(hwnd, null_mut(), 0);
+                    }
+                }
+            }
+            0
+        }
+        WM_LBUTTONUP => {
+            let state = IMAGE_STATE.as_mut().unwrap();
+            if state.selecting && state.has_image() {
+                let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
+                let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+                if let Some((ix, iy)) = window_to_image_coords(hwnd, state.current_width, state.current_height, mx, my) {
+                    state.select_end = Some((ix, iy));
+                }
+                state.selecting = false;
+                if let (Some((x1,y1)), Some((x2,y2))) = (state.select_start, state.select_end) {
+                    if let Some(ref sam) = state.sam_processor {
+                        if sam.is_encoded() {
+                            let (fx1, fy1) = (x1.min(x2) as f32, y1.min(y2) as f32);
+                            let (fx2, fy2) = (x1.max(x2) as f32, y1.max(y2) as f32);
+                            match sam.decode_prompt(fx1, fy1, fx2, fy2) {
+                                Ok((mask, mw, mh)) => {
+                                    if let Err(e) = overlay_mask_on_current(state, &mask, mw as i32, mh as i32) {
+                                        println!("❌ 叠加分割结果失败: {}", e);
+                                    } else {
+                                        InvalidateRect(hwnd, null_mut(), 1);
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("❌ SAM分割失败: {}", e);
+                                    let msg = format!("SAM分割失败：\n{}", e);
+                                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                    let title_utf16: Vec<u16> = "分割失败".encode_utf16().chain(std::iter::once(0)).collect();
+                                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                                }
+                            }
+                        }
+                    }
+                }
+                InvalidateRect(hwnd, null_mut(), 1);
+            }
+            0
+        }
         WM_SIZE => {
             // 窗口大小改变时重绘
             InvalidateRect(hwnd, null_mut(), 1);
@@ -758,11 +1029,16 @@ unsafe extern "system" fn window_proc(
             let window_width = rect.right - rect.left;
             let window_height = rect.bottom - rect.top;
             
-            // 填充背景为黑色
+            // 双缓冲：创建内存DC和位图，所有绘制先在内存DC完成
+            let mem_dc = CreateCompatibleDC(hdc);
+            let mem_bmp = CreateCompatibleBitmap(hdc, window_width, window_height);
+            let old_bmp = SelectObject(mem_dc, mem_bmp as HGDIOBJ);
+
+            // 背景清为黑色
             let black_brush = CreateSolidBrush(RGB(0, 0, 0));
-            FillRect(hdc, &rect, black_brush);
+            FillRect(mem_dc, &rect, black_brush);
             DeleteObject(black_brush as *mut _);
-            
+
             // 绘制图片
             if let Some(ref state) = IMAGE_STATE {
                 if state.has_image() && !state.display_pixels.is_empty() {
@@ -774,10 +1050,10 @@ unsafe extern "system" fn window_proc(
                     );
                     
                     // 设置高质量拉伸模式 - HALFTONE提供最佳质量
-                    SetStretchBltMode(hdc, HALFTONE);
+                    SetStretchBltMode(mem_dc, HALFTONE);
                     
                     // 设置画刷原点以改善抖动效果
-                    SetBrushOrgEx(hdc, 0, 0, std::ptr::null_mut());
+                    SetBrushOrgEx(mem_dc, 0, 0, std::ptr::null_mut());
                     
                     // 创建位图信息结构
                     let bmi = BITMAPINFO {
@@ -804,7 +1080,7 @@ unsafe extern "system" fn window_proc(
                     
                     // 使用StretchDIBits进行高质量图片绘制
                     StretchDIBits(
-                        hdc,
+                        mem_dc,
                         x,                               // 目标x坐标
                         y,                               // 目标y坐标
                         scaled_width,                    // 目标宽度
@@ -819,6 +1095,32 @@ unsafe extern "system" fn window_proc(
                         SRCCOPY,
                     );
                     
+                    // 正在框选时叠加绘制矩形
+                    if state.selecting {
+                        if let (Some((sx, sy)), Some((ex, ey))) = (state.select_start, state.select_end) {
+                            // 将图像坐标转换回窗口坐标用于绘制
+                            let to_win = |ix: i32, iy: i32| -> (i32,i32) {
+                                let wx = x + (ix * scaled_width) / state.current_width;
+                                let wy = y + (iy * scaled_height) / state.current_height;
+                                (wx, wy)
+                            };
+                            let (wx1, wy1) = to_win(sx, sy);
+                            let (wx2, wy2) = to_win(ex, ey);
+                            let left = wx1.min(wx2);
+                            let top = wy1.min(wy2);
+                            let right = wx1.max(wx2);
+                            let bottom = wy1.max(wy2);
+                            let pen = CreatePen(PS_SOLID as i32, 2, RGB(0,255,0));
+                            let old_pen = SelectObject(mem_dc, pen as HGDIOBJ);
+                            let hollow_brush = GetStockObject(HOLLOW_BRUSH as i32) as HBRUSH;
+                            let old_brush = SelectObject(mem_dc, hollow_brush as HGDIOBJ);
+                            Rectangle(mem_dc, left, top, right, bottom);
+                            SelectObject(mem_dc, old_pen);
+                            SelectObject(mem_dc, old_brush);
+                            DeleteObject(pen as HGDIOBJ);
+                        }
+                    }
+                    
                     // 更新窗口标题显示图像信息
                     let info_text = format!("图像查看器 - {}x{} - OpenCV处理", 
                         state.current_width, 
@@ -831,11 +1133,11 @@ unsafe extern "system" fn window_proc(
                     let hint_text = "请使用菜单 文件->打开文件 来加载图像";
                     let text_utf16: Vec<u16> = hint_text.encode_utf16().collect();
                     
-                    SetTextColor(hdc, RGB(255, 255, 255));
-                    SetBkMode(hdc, TRANSPARENT as i32);
+                    SetTextColor(mem_dc, RGB(255, 255, 255));
+                    SetBkMode(mem_dc, TRANSPARENT as i32);
                     
                     DrawTextW(
-                        hdc,
+                        mem_dc,
                         text_utf16.as_ptr(),
                         text_utf16.len() as i32,
                         &mut rect,
@@ -843,6 +1145,14 @@ unsafe extern "system" fn window_proc(
                     );
                 }
             }
+
+            // 将内存DC内容拷贝到前台，一次提交减少闪烁
+            BitBlt(hdc, 0, 0, window_width, window_height, mem_dc, 0, 0, SRCCOPY);
+
+            // 释放内存对象
+            SelectObject(mem_dc, old_bmp);
+            DeleteObject(mem_bmp as HGDIOBJ);
+            DeleteDC(mem_dc);
             
             EndPaint(hwnd, &ps);
             0
