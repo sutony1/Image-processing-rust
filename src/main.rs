@@ -31,6 +31,7 @@ const MENU_SAVE_FILE: u32 = 1012;
 // 添加SAM相关菜单项
 const MENU_SAM_ENCODE: u32 = 1013;
 const MENU_SAM_SEGMENT: u32 = 1014;
+const MENU_SAM_EXTRACT_MASK: u32 = 1015; // 新增：抠图并显示
 
 // 全局变量存储图像数据
 static mut IMAGE_STATE: Option<ImageState> = None;
@@ -45,6 +46,7 @@ struct ImageState {
     selecting: bool,
     select_start: Option<(i32,i32)>,
     select_end: Option<(i32,i32)>,
+    current_mask: Option<(Vec<u8>, i32, i32)>, // 新增：存储当前mask信息
 }
 
 impl ImageState {
@@ -59,6 +61,7 @@ impl ImageState {
             selecting: false,
             select_start: None,
             select_end: None,
+            current_mask: None, // 新增
         }
     }
     
@@ -154,6 +157,21 @@ impl ImageState {
             println!("✅ SAM处理器初始化成功");
         }
         Ok(())
+    }
+
+    // 新增：设置当前mask
+    fn set_current_mask(&mut self, mask: Vec<u8>, mask_w: i32, mask_h: i32) {
+        self.current_mask = Some((mask, mask_w, mask_h));
+    }
+
+    // 新增：检查是否有可用的mask
+    fn has_mask(&self) -> bool {
+        self.current_mask.is_some()
+    }
+
+    // 新增：获取当前mask
+    fn get_current_mask(&self) -> Option<&(Vec<u8>, i32, i32)> {
+        self.current_mask.as_ref()
     }
 }
 
@@ -284,6 +302,11 @@ unsafe fn create_menu() -> HMENU {
     let sam_segment_text = "SAM交互分割(&S)";
     let sam_segment_utf16: Vec<u16> = sam_segment_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(sam_menu, MF_STRING, MENU_SAM_SEGMENT as usize, sam_segment_utf16.as_ptr());
+    
+    // 新增：抠图并显示命令
+    let sam_extract_text = "抠图并显示(&E)";
+    let sam_extract_utf16: Vec<u16> = sam_extract_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(sam_menu, MF_STRING, MENU_SAM_EXTRACT_MASK as usize, sam_extract_utf16.as_ptr());
     
     let sam_text = "SAM分割(&S)";
     let sam_utf16: Vec<u16> = sam_text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -461,6 +484,139 @@ fn overlay_mask_on_current(state: &mut ImageState, mask: &[u8], mask_w: i32, mas
     blended.copy_to_masked(&mut result, &mask_bin)?;
 
     state.update_display_from_mat(&result)?;
+    Ok(())
+}
+
+// 新增：抠图并显示功能
+fn extract_mask_and_display(state: &mut ImageState) -> Result<()> {
+    use opencv::{imgproc, core as cvcore};
+    
+    // 检查是否有可用的mask
+    let (mask, mask_w, mask_h) = match state.get_current_mask() {
+        Some(mask_info) => mask_info.clone(),
+        None => {
+            return Err(anyhow::anyhow!("没有可用的mask，请先进行SAM分割"));
+        }
+    };
+    
+    // 检查是否有原始图像
+    let original_img = match &state.original_bgr {
+        Some(img) => img,
+        None => {
+            return Err(anyhow::anyhow!("没有原始图像"));
+        }
+    };
+    
+    println!("🔍 开始抠图处理...");
+    println!("  mask尺寸: {}x{}", mask_w, mask_h);
+    println!("  原图尺寸: {}x{}", original_img.cols(), original_img.rows());
+    
+    // 找到mask的边界框
+    let mut y_min = mask_h;
+    let mut y_max = 0;
+    let mut x_min = mask_w;
+    let mut x_max = 0;
+    
+    for y in 0..mask_h {
+        for x in 0..mask_w {
+            let idx = (y * mask_w + x) as usize;
+            if idx < mask.len() && mask[idx] > 0 {
+                y_min = y_min.min(y);
+                y_max = y_max.max(y);
+                x_min = x_min.min(x);
+                x_max = x_max.max(x);
+            }
+        }
+    }
+    
+    if y_min >= y_max || x_min >= x_max {
+        return Err(anyhow::anyhow!("mask中没有有效区域"));
+    }
+    
+    println!("  mask边界框: ({},{}) -> ({},{})", x_min, y_min, x_max, y_max);
+    
+    // 为边界框添加padding
+    let padding = 10;
+    y_min = (y_min - padding).max(0);
+    y_max = (y_max + padding).min(mask_h - 1);
+    x_min = (x_min - padding).max(0);
+    x_max = (x_max + padding).min(mask_w - 1);
+    
+    println!("  添加padding后边界框: ({},{}) -> ({},{})", x_min, y_min, x_max, y_max);
+    
+    // 将mask坐标映射到原图坐标
+    let scale_x = original_img.cols() as f64 / mask_w as f64;
+    let scale_y = original_img.rows() as f64 / mask_h as f64;
+    
+    let orig_x_min = (x_min as f64 * scale_x) as i32;
+    let orig_y_min = (y_min as f64 * scale_y) as i32;
+    let orig_x_max = (x_max as f64 * scale_x) as i32;
+    let orig_y_max = (y_max as f64 * scale_y) as i32;
+    
+    println!("  原图裁剪区域: ({},{}) -> ({},{})", orig_x_min, orig_y_min, orig_x_max, orig_y_max);
+    
+    // 裁剪原始图像
+    let roi = cvcore::Rect::new(orig_x_min, orig_y_min, orig_x_max - orig_x_min, orig_y_max - orig_y_min);
+    let cropped_img = match Mat::roi(original_img, roi) {
+        Ok(roi_mat) => roi_mat.try_clone()?,
+        Err(_) => {
+            return Err(anyhow::anyhow!("裁剪图像失败，ROI超出边界"));
+        }
+    };
+    
+    // 裁剪对应的mask区域
+    let mask_roi = cvcore::Rect::new(x_min, y_min, x_max - x_min, y_max - y_min);
+    let mut mask_mat = cvcore::Mat::new_rows_cols_with_default(mask_h, mask_w, cvcore::CV_8UC1, cvcore::Scalar::all(0.0))?;
+    
+    // 将mask数据复制到Mat中
+    unsafe {
+        let total = (mask_w * mask_h) as usize;
+        std::ptr::copy_nonoverlapping(mask.as_ptr(), mask_mat.data_mut() as *mut u8, total);
+    }
+    
+    let cropped_mask = match Mat::roi(&mask_mat, mask_roi) {
+        Ok(roi_mat) => roi_mat.try_clone()?,
+        Err(_) => {
+            return Err(anyhow::anyhow!("裁剪mask失败"));
+        }
+    };
+    
+    // 将mask缩放到裁剪图像的尺寸
+    let mut resized_mask = cvcore::Mat::default();
+    imgproc::resize(
+        &cropped_mask, 
+        &mut resized_mask, 
+        cvcore::Size::new(cropped_img.cols(), cropped_img.rows()), 
+        0.0, 0.0, 
+        imgproc::INTER_NEAREST
+    )?;
+    
+    // 创建结果图像（黑色背景）
+    let mut result = cvcore::Mat::new_rows_cols_with_default(
+        cropped_img.rows(), 
+        cropped_img.cols(), 
+        cvcore::CV_8UC3, 
+        cvcore::Scalar::all(0.0)
+    )?;
+    
+    // 应用mask：只在mask区域复制原图像素，其他区域保持黑色
+    for y in 0..cropped_img.rows() {
+        for x in 0..cropped_img.cols() {
+            let mask_val = unsafe { *resized_mask.ptr_2d(y, x)? };
+            if mask_val > 0 {
+                // 直接复制原图像素，不添加任何颜色覆盖
+                let pixel = unsafe { *cropped_img.ptr_2d(y, x)? };
+                unsafe { *result.ptr_2d_mut(y, x)? = pixel };
+            }
+            // 非mask区域保持黑色（已经是0，无需处理）
+        }
+    }
+    
+    println!("✅ 抠图完成，结果尺寸: {}x{}", result.cols(), result.rows());
+    
+    // 更新显示
+    state.update_display_from_mat(&result)?;
+    
     Ok(())
 }
 
@@ -811,7 +967,7 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                             match sam.encode_image(current) {
                                 Ok(()) => {
                                     println!("✅ SAM图像编码完成");
-                                    let msg = "SAM图像编码完成！\n\n现在可以使用\"SAM交互分割\"功能，在图像上拖拽框选目标。";
+                                    let msg = "SAM图像编码完成！\n\n现在可以使用\"SAM交互分割\"功能进行对象分割。";
                                     let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
                                     let title_utf16: Vec<u16> = "编码成功".encode_utf16().chain(std::iter::once(0)).collect();
                                     MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
@@ -828,7 +984,7 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                     }
                     Err(e) => {
                         println!("❌ SAM处理器初始化失败: {}", e);
-                        let error_msg = format!("SAM处理器初始化失败：\n{}\n\n请确保ONNX模型文件可用", e);
+                        let error_msg = format!("SAM处理器初始化失败：\n{}\n\n请确保ONNX模型文件存在", e);
                         let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
                         let title_utf16: Vec<u16> = "初始化失败".encode_utf16().chain(std::iter::once(0)).collect();
                         MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
@@ -862,66 +1018,33 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             state.select_end = None;
             println!("🖱️ SAM交互分割：请在图像上按下并拖拽以框选目标，释放鼠标完成框选");
         }
-        MENU_SAM_ENCODE => {
-            if let Some(ref current) = state.current_mat.clone() {
-                match state.init_sam_processor() {
-                    Ok(()) => {
-                        if let Some(ref mut sam) = state.sam_processor {
-                            match sam.encode_image(current) {
-                                Ok(()) => {
-                                    println!("✅ SAM图像编码完成");
-                                    let msg = "SAM图像编码完成！\n\n现在可以使用\"SAM交互分割\"功能进行对象分割。";
-                                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                                    let title_utf16: Vec<u16> = "编码成功".encode_utf16().chain(std::iter::once(0)).collect();
-                                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
-                                }
-                                Err(e) => {
-                                    println!("❌ SAM编码失败: {}", e);
-                                    let error_msg = format!("SAM编码失败：\n{}", e);
-                                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                                    let title_utf16: Vec<u16> = "编码失败".encode_utf16().chain(std::iter::once(0)).collect();
-                                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("❌ SAM处理器初始化失败: {}", e);
-                        let error_msg = format!("SAM处理器初始化失败：\n{}\n\n请确保ONNX模型文件存在", e);
-                        let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                        let title_utf16: Vec<u16> = "初始化失败".encode_utf16().chain(std::iter::once(0)).collect();
-                        MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
-                    }
-                }
-            } else {
-                let msg = "没有可用的图像，请先加载图像";
-                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
-            }
-        }
         
-        MENU_SAM_SEGMENT => {
-            if let Some(ref sam) = state.sam_processor {
-                if !sam.is_encoded() {
-                    let msg = "请先使用\"SAM编码图像\"功能对当前图像进行编码";
-                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                    let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
-                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
-                    return;
-                }
-                
-                // 这里可以实现交互式分割界面
-                // 暂时显示提示信息
-                let msg = "SAM交互分割功能\n\n请点击图像上的两个点来定义边界框，\n系统将自动分割框内的对象。\n\n注意：此功能需要鼠标事件支持，\n当前版本为演示版本。";
-                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                let title_utf16: Vec<u16> = "SAM分割".encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
-            } else {
-                let msg = "SAM处理器未初始化，请先使用\"SAM编码图像\"功能";
+        MENU_SAM_EXTRACT_MASK => {
+            if !state.has_mask() {
+                let msg = "没有可用的mask，请先进行SAM分割！\n\n使用\"SAM交互分割\"功能在图像上拖拽框选目标，生成mask后再使用此功能。";
                 let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
                 let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
                 MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                return;
+            }
+            
+            match extract_mask_and_display(state) {
+                Ok(()) => {
+                    println!("✅ 抠图并显示完成");
+                    InvalidateRect(hwnd, null_mut(), 1);
+                    
+                    let msg = "抠图完成！\n\n当前显示的是从原图中裁剪出的mask区域。\n黑色区域表示非mask部分，彩色区域是mask内的原图像素。\n\n您可以使用\"保存文件\"功能保存这个抠图结果。";
+                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "抠图成功".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                }
+                Err(e) => {
+                    println!("❌ 抠图失败: {}", e);
+                    let error_msg = format!("抠图处理失败：\n{}", e);
+                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "抠图失败".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                }
             }
         }
         
@@ -993,6 +1116,9 @@ unsafe extern "system" fn window_proc(
                             let (fx2, fy2) = (x1.max(x2) as f32, y1.max(y2) as f32);
                             match sam.decode_prompt(fx1, fy1, fx2, fy2) {
                                 Ok((mask, mw, mh)) => {
+                                    // 保存mask到状态中
+                                    state.set_current_mask(mask.clone(), mw as i32, mh as i32);
+                                    
                                     if let Err(e) = overlay_mask_on_current(state, &mask, mw as i32, mh as i32) {
                                         println!("❌ 叠加分割结果失败: {}", e);
                                     } else {
