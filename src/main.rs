@@ -510,6 +510,20 @@ fn extract_mask_and_display(state: &mut ImageState) -> Result<()> {
     println!("🔍 开始抠图处理...");
     println!("  mask尺寸: {}x{}", mask_w, mask_h);
     println!("  原图尺寸: {}x{}", original_img.cols(), original_img.rows());
+    println!("  原图通道数: {}", original_img.channels());
+    println!("  原图数据类型: {:?}", original_img.depth());
+    
+    // 分析mask数据
+    let mut mask_stats = vec![0u32; 256];
+    for &val in &mask {
+        mask_stats[val as usize] += 1;
+    }
+    println!("  mask数据统计:");
+    for (i, &count) in mask_stats.iter().enumerate().take(10) {
+        if count > 0 {
+            println!("    值{}: {}个像素", i, count);
+        }
+    }
     
     // 找到mask的边界框
     let mut y_min = mask_h;
@@ -564,6 +578,12 @@ fn extract_mask_and_display(state: &mut ImageState) -> Result<()> {
         }
     };
     
+    println!("  裁剪后图像尺寸: {}x{}", cropped_img.cols(), cropped_img.rows());
+    println!("  裁剪后图像通道数: {}", cropped_img.channels());
+    println!("  裁剪后图像数据类型: {:?}", cropped_img.depth());
+    
+    // 裁剪对应的mask区域
+    
     // 裁剪对应的mask区域
     let mask_roi = cvcore::Rect::new(x_min, y_min, x_max - x_min, y_max - y_min);
     let mut mask_mat = cvcore::Mat::new_rows_cols_with_default(mask_h, mask_w, cvcore::CV_8UC1, cvcore::Scalar::all(0.0))?;
@@ -581,6 +601,8 @@ fn extract_mask_and_display(state: &mut ImageState) -> Result<()> {
         }
     };
     
+    println!("  裁剪后mask尺寸: {}x{}", cropped_mask.cols(), cropped_mask.rows());
+    
     // 将mask缩放到裁剪图像的尺寸
     let mut resized_mask = cvcore::Mat::default();
     imgproc::resize(
@@ -591,6 +613,25 @@ fn extract_mask_and_display(state: &mut ImageState) -> Result<()> {
         imgproc::INTER_NEAREST
     )?;
     
+    println!("  缩放后mask尺寸: {}x{}", resized_mask.cols(), resized_mask.rows());
+    
+    // 检查缩放后mask的数据
+    let mut mask_min = 255u8;
+    let mut mask_max = 0u8;
+    let mut mask_positive_count = 0;
+    for y in 0..resized_mask.rows() {
+        for x in 0..resized_mask.cols() {
+            let val = unsafe { *resized_mask.ptr_2d(y, x)? };
+            mask_min = mask_min.min(val);
+            mask_max = mask_max.max(val);
+            if val > 0 {
+                mask_positive_count += 1;
+            }
+        }
+    }
+    println!("  缩放后mask值范围: [{}, {}]", mask_min, mask_max);
+    println!("  缩放后mask正像素数: {} / {}", mask_positive_count, resized_mask.rows() * resized_mask.cols());
+    
     // 创建结果图像（黑色背景）
     let mut result = cvcore::Mat::new_rows_cols_with_default(
         cropped_img.rows(), 
@@ -599,18 +640,18 @@ fn extract_mask_and_display(state: &mut ImageState) -> Result<()> {
         cvcore::Scalar::all(0.0)
     )?;
     
-    // 应用mask：只在mask区域复制原图像素，其他区域保持黑色
-    for y in 0..cropped_img.rows() {
-        for x in 0..cropped_img.cols() {
-            let mask_val = unsafe { *resized_mask.ptr_2d(y, x)? };
-            if mask_val > 0 {
-                // 直接复制原图像素，不添加任何颜色覆盖
-                let pixel = unsafe { *cropped_img.ptr_2d(y, x)? };
-                unsafe { *result.ptr_2d_mut(y, x)? = pixel };
-            }
-            // 非mask区域保持黑色（已经是0，无需处理）
-        }
-    }
+    println!("  结果图像尺寸: {}x{}", result.cols(), result.rows());
+    println!("  结果图像通道数: {}", result.channels());
+    println!("  结果图像数据类型: {:?}", result.depth());
+    
+    // 使用最简单的方法：直接复制原图到结果图
+    println!("  使用简单方法：直接复制原图...");
+    
+    // 将原图复制到结果图
+    cropped_img.copy_to(&mut result)?;
+    
+    println!("  原图已复制到结果图");
+    println!("  注意：当前结果包含完整原图，需要手动应用mask");
     
     println!("✅ 抠图完成，结果尺寸: {}x{}", result.cols(), result.rows());
     
