@@ -644,14 +644,74 @@ fn extract_mask_and_display(state: &mut ImageState) -> Result<()> {
     println!("  结果图像通道数: {}", result.channels());
     println!("  结果图像数据类型: {:?}", result.depth());
     
-    // 使用最简单的方法：直接复制原图到结果图
-    println!("  使用简单方法：直接复制原图...");
+    // 使用Python参考代码的方法：创建黑色背景，只在mask区域复制原图像素
+    println!("  使用Python参考方法：创建黑色背景，应用mask...");
     
-    // 将原图复制到结果图
-    cropped_img.copy_to(&mut result)?;
+    // 结果图像已经是全零（黑色），现在只在mask区域复制原图像素
+    let mut copied_pixels = 0;
+    let mut skipped_pixels = 0;
     
-    println!("  原图已复制到结果图");
-    println!("  注意：当前结果包含完整原图，需要手动应用mask");
+    // 添加更详细的调试信息
+    println!("  开始像素复制循环...");
+    println!("  原图像尺寸: {}x{}", cropped_img.cols(), cropped_img.rows());
+    println!("  mask尺寸: {}x{}", resized_mask.cols(), resized_mask.rows());
+    println!("  结果图像尺寸: {}x{}", result.cols(), result.rows());
+    
+    // 检查前几个像素的值作为样本
+    println!("  样本像素检查（前3x3区域）:");
+    for y in 0..3.min(cropped_img.rows()) {
+        for x in 0..3.min(cropped_img.cols()) {
+            let mask_val = unsafe { *resized_mask.ptr_2d(y, x)? };
+            // 对于BGR三通道图像，使用正确的像素访问方式
+            let pixel_ptr = unsafe { cropped_img.ptr_2d(y, x)? };
+            let b_val = unsafe { *pixel_ptr };
+            let g_val = unsafe { *pixel_ptr.add(1) };
+            let r_val = unsafe { *pixel_ptr.add(2) };
+            println!("    位置({},{}): mask={}, BGR=({},{},{})", x, y, mask_val, b_val, g_val, r_val);
+        }
+    }
+    
+    for y in 0..cropped_img.rows() {
+        for x in 0..cropped_img.cols() {
+            let mask_val = unsafe { *resized_mask.ptr_2d(y, x)? };
+            if mask_val > 0 {
+                // 复制原图像素到结果图
+                let src_pixel_ptr = unsafe { cropped_img.ptr_2d(y, x)? };
+                let dst_pixel_ptr = unsafe { result.ptr_2d_mut(y, x)? };
+                unsafe { 
+                    *dst_pixel_ptr = *src_pixel_ptr;
+                    *dst_pixel_ptr.add(1) = *src_pixel_ptr.add(1);
+                    *dst_pixel_ptr.add(2) = *src_pixel_ptr.add(2);
+                }
+                copied_pixels += 1;
+                
+                // 每1000个像素打印一次进度
+                if copied_pixels % 1000 == 0 {
+                    println!("    已复制 {} 个像素...", copied_pixels);
+                }
+            } else {
+                // 非mask区域保持黑色（已经是0，无需处理）
+                skipped_pixels += 1;
+            }
+        }
+    }
+    
+    println!("  像素复制完成:");
+    println!("    复制的像素: {}", copied_pixels);
+    println!("    跳过的像素: {}", skipped_pixels);
+    println!("    结果：mask区域显示原图像素，非mask区域为纯黑色");
+    
+    // 检查结果图像的前几个像素值
+    println!("  结果图像样本像素检查（前3x3区域）:");
+    for y in 0..3.min(result.rows()) {
+        for x in 0..3.min(result.cols()) {
+            let pixel_ptr = unsafe { result.ptr_2d(y, x)? };
+            let b_val = unsafe { *pixel_ptr };
+            let g_val = unsafe { *pixel_ptr.add(1) };
+            let r_val = unsafe { *pixel_ptr.add(2) };
+            println!("    位置({},{}): BGR=({},{},{})", x, y, b_val, g_val, r_val);
+        }
+    }
     
     println!("✅ 抠图完成，结果尺寸: {}x{}", result.cols(), result.rows());
     
