@@ -12,7 +12,7 @@ use anyhow::{Result, Context};
 
 mod ocv_bridge;
 mod cv_ops;
-mod sam_integration;
+mod sam_core;
 
 // 菜单项ID常量
 const MENU_OPEN_FILE: u32 = 1000;
@@ -41,7 +41,7 @@ struct ImageState {
     display_pixels: Vec<u8>,
     current_width: i32,
     current_height: i32,
-    sam_processor: Option<sam_integration::SAMProcessor>, // 新增
+    sam_processor: Option<sam_core::SAMProcessor>, // 新增
     selecting: bool,
     select_start: Option<(i32,i32)>,
     select_end: Option<(i32,i32)>,
@@ -150,7 +150,7 @@ impl ImageState {
 
     fn init_sam_processor(&mut self) -> Result<()> {
         if self.sam_processor.is_none() {
-            self.sam_processor = Some(sam_integration::SAMProcessor::new()?);
+            self.sam_processor = Some(sam_core::SAMProcessor::new()?);
             println!("✅ SAM处理器初始化成功");
         }
         Ok(())
