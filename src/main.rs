@@ -32,6 +32,9 @@ const MENU_SAVE_FILE: u32 = 1012;
 const MENU_SAM_ENCODE: u32 = 1013;
 const MENU_SAM_SEGMENT: u32 = 1014;
 const MENU_SAM_EXTRACT_MASK: u32 = 1015; // 新增：抠图并显示
+// 新增：选框工具和裁剪菜单
+const MENU_SELECTION_TOOL: u32 = 1016; // 选框工具
+const MENU_CROP_SELECTION: u32 = 1017; // 裁剪选框区域
 
 // 全局变量存储图像数据
 static mut IMAGE_STATE: Option<ImageState> = None;
@@ -47,6 +50,10 @@ struct ImageState {
     select_start: Option<(i32,i32)>,
     select_end: Option<(i32,i32)>,
     current_mask: Option<(Vec<u8>, i32, i32)>, // 新增：存储当前mask信息
+    // 新增：选框工具相关状态
+    selection_mode: bool, // 是否处于选框模式
+    selection_start: Option<(i32,i32)>, // 选框起始点
+    selection_end: Option<(i32,i32)>, // 选框结束点
 }
 
 impl ImageState {
@@ -62,6 +69,9 @@ impl ImageState {
             select_start: None,
             select_end: None,
             current_mask: None, // 新增
+            selection_mode: false, // 新增：选框模式
+            selection_start: None, // 新增：选框起始点
+            selection_end: None, // 新增：选框结束点
         }
     }
     
@@ -172,6 +182,34 @@ impl ImageState {
     // 新增：获取当前mask
     fn get_current_mask(&self) -> Option<&(Vec<u8>, i32, i32)> {
         self.current_mask.as_ref()
+    }
+
+    // 新增：选框工具相关方法
+    fn start_selection_mode(&mut self) {
+        self.selection_mode = true;
+        self.selection_start = None;
+        self.selection_end = None;
+        println!("🖱️ 选框工具已激活：请在图像上按下并拖拽以框选区域，释放鼠标完成框选");
+    }
+
+    fn end_selection_mode(&mut self) {
+        self.selection_mode = false;
+    }
+
+    fn has_selection(&self) -> bool {
+        self.selection_start.is_some() && self.selection_end.is_some()
+    }
+
+    fn get_selection_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        if let (Some((x1, y1)), Some((x2, y2))) = (self.selection_start, self.selection_end) {
+            let left = x1.min(x2);
+            let top = y1.min(y2);
+            let right = x1.max(x2);
+            let bottom = y1.max(y2);
+            Some((left, top, right, bottom))
+        } else {
+            None
+        }
     }
 }
 
@@ -311,6 +349,20 @@ unsafe fn create_menu() -> HMENU {
     let sam_text = "SAM分割(&S)";
     let sam_utf16: Vec<u16> = sam_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(menu_bar, MF_POPUP, sam_menu as usize, sam_utf16.as_ptr());
+    
+    // 新增：选框工具和裁剪菜单
+    let selection_menu = CreatePopupMenu();
+    let selection_tool_text = "选框工具(&S)";
+    let selection_tool_utf16: Vec<u16> = selection_tool_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(selection_menu, MF_STRING, MENU_SELECTION_TOOL as usize, selection_tool_utf16.as_ptr());
+    
+    let crop_selection_text = "裁剪选框区域(&C)";
+    let crop_selection_utf16: Vec<u16> = crop_selection_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(selection_menu, MF_STRING, MENU_CROP_SELECTION as usize, crop_selection_utf16.as_ptr());
+    
+    let selection_text = "选框工具(&S)";
+    let selection_utf16: Vec<u16> = selection_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(menu_bar, MF_POPUP, selection_menu as usize, selection_utf16.as_ptr());
     
     menu_bar
 }
@@ -1149,6 +1201,45 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             }
         }
         
+        // 新增：选框工具菜单处理
+        MENU_SELECTION_TOOL => {
+            match start_selection_tool(state) {
+                Ok(()) => {
+                    println!("✅ 选框工具已激活");
+                    InvalidateRect(hwnd, null_mut(), 1);
+                }
+                Err(e) => {
+                    println!("❌ 启动选框工具失败: {}", e);
+                    let error_msg = format!("启动选框工具失败：\n{}", e);
+                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "选框工具失败".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                }
+            }
+        }
+        
+        // 新增：裁剪选框区域菜单处理
+        MENU_CROP_SELECTION => {
+            match crop_selection_area(state) {
+                Ok(()) => {
+                    println!("✅ 选框区域裁剪完成");
+                    InvalidateRect(hwnd, null_mut(), 1);
+                    
+                    let msg = "选框区域裁剪完成！\n\n当前显示的是从原图中裁剪出的选框区域。\n您可以使用\"保存文件\"功能保存这个裁剪结果。";
+                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "裁剪成功".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                }
+                Err(e) => {
+                    println!("❌ 选框区域裁剪失败: {}", e);
+                    let error_msg = format!("选框区域裁剪失败：\n{}", e);
+                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "裁剪失败".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                }
+            }
+        }
+        
         _ => {}
     }
 }
@@ -1176,12 +1267,19 @@ unsafe extern "system" fn window_proc(
 		}
         WM_LBUTTONDOWN => {
             let state = IMAGE_STATE.as_mut().unwrap();
-            if state.selecting && state.has_image() {
+            if state.has_image() {
                 let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
                 let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
                 if let Some((ix, iy)) = window_to_image_coords(hwnd, state.current_width, state.current_height, mx, my) {
-                    state.select_start = Some((ix, iy));
-                    state.select_end = Some((ix, iy));
+                    if state.selecting {
+                        // SAM交互分割模式
+                        state.select_start = Some((ix, iy));
+                        state.select_end = Some((ix, iy));
+                    } else if state.selection_mode {
+                        // 选框工具模式
+                        state.selection_start = Some((ix, iy));
+                        state.selection_end = Some((ix, iy));
+                    }
                     InvalidateRect(hwnd, null_mut(), 1);
                 }
             }
@@ -1190,11 +1288,17 @@ unsafe extern "system" fn window_proc(
         WM_MOUSEMOVE => {
             if (wparam & MK_LBUTTON as usize) != 0 {
                 let state = IMAGE_STATE.as_mut().unwrap();
-                if state.selecting && state.has_image() {
+                if state.has_image() {
                     let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
                     let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
                     if let Some((ix, iy)) = window_to_image_coords(hwnd, state.current_width, state.current_height, mx, my) {
-                        state.select_end = Some((ix, iy));
+                        if state.selecting {
+                            // SAM交互分割模式
+                            state.select_end = Some((ix, iy));
+                        } else if state.selection_mode {
+                            // 选框工具模式
+                            state.selection_end = Some((ix, iy));
+                        }
                         InvalidateRect(hwnd, null_mut(), 0);
                     }
                 }
@@ -1203,38 +1307,48 @@ unsafe extern "system" fn window_proc(
         }
         WM_LBUTTONUP => {
             let state = IMAGE_STATE.as_mut().unwrap();
-            if state.selecting && state.has_image() {
+            if state.has_image() {
                 let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
                 let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
                 if let Some((ix, iy)) = window_to_image_coords(hwnd, state.current_width, state.current_height, mx, my) {
-                    state.select_end = Some((ix, iy));
-                }
-                state.selecting = false;
-                if let (Some((x1,y1)), Some((x2,y2))) = (state.select_start, state.select_end) {
-                    if let Some(ref sam) = state.sam_processor {
-                        if sam.is_encoded() {
-                            let (fx1, fy1) = (x1.min(x2) as f32, y1.min(y2) as f32);
-                            let (fx2, fy2) = (x1.max(x2) as f32, y1.max(y2) as f32);
-                            match sam.decode_prompt(fx1, fy1, fx2, fy2) {
-                                Ok((mask, mw, mh)) => {
-                                    // 保存mask到状态中
-                                    state.set_current_mask(mask.clone(), mw as i32, mh as i32);
-                                    
-                                    if let Err(e) = overlay_mask_on_current(state, &mask, mw as i32, mh as i32) {
-                                        println!("❌ 叠加分割结果失败: {}", e);
-                                    } else {
-                                        InvalidateRect(hwnd, null_mut(), 1);
+                    if state.selecting {
+                        // SAM交互分割模式
+                        state.select_end = Some((ix, iy));
+                        state.selecting = false;
+                        if let (Some((x1,y1)), Some((x2,y2))) = (state.select_start, state.select_end) {
+                            if let Some(ref sam) = state.sam_processor {
+                                if sam.is_encoded() {
+                                    let (fx1, fy1) = (x1.min(x2) as f32, y1.min(y2) as f32);
+                                    let (fx2, fy2) = (x1.max(x2) as f32, y1.max(y2) as f32);
+                                    match sam.decode_prompt(fx1, fy1, fx2, fy2) {
+                                        Ok((mask, mw, mh)) => {
+                                            // 保存mask到状态中
+                                            state.set_current_mask(mask.clone(), mw as i32, mh as i32);
+                                            
+                                            if let Err(e) = overlay_mask_on_current(state, &mask, mw as i32, mh as i32) {
+                                                println!("❌ 叠加分割结果失败: {}", e);
+                                            } else {
+                                                InvalidateRect(hwnd, null_mut(), 1);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            println!("❌ SAM分割失败: {}", e);
+                                            let msg = format!("SAM分割失败：\n{}", e);
+                                            let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                            let title_utf16: Vec<u16> = "分割失败".encode_utf16().chain(std::iter::once(0)).collect();
+                                            MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    println!("❌ SAM分割失败: {}", e);
-                                    let msg = format!("SAM分割失败：\n{}", e);
-                                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                                    let title_utf16: Vec<u16> = "分割失败".encode_utf16().chain(std::iter::once(0)).collect();
-                                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
                                 }
                             }
                         }
+                    } else if state.selection_mode {
+                        // 选框工具模式
+                        state.selection_end = Some((ix, iy));
+                        // 选框工具模式下不自动退出，保持选框显示
+                        println!("✅ 选框完成: ({},{}) -> ({},{})", 
+                            state.selection_start.unwrap().0, state.selection_start.unwrap().1,
+                            ix, iy);
                     }
                 }
                 InvalidateRect(hwnd, null_mut(), 1);
@@ -1345,6 +1459,42 @@ unsafe extern "system" fn window_proc(
                             SelectObject(mem_dc, old_pen);
                             SelectObject(mem_dc, old_brush);
                             DeleteObject(pen as HGDIOBJ);
+                        }
+                    }
+                    
+                    // 新增：选框工具选框绘制
+                    if state.selection_mode && state.has_selection() {
+                        if let (Some((sx, sy)), Some((ex, ey))) = (state.selection_start, state.selection_end) {
+                            // 将图像坐标转换回窗口坐标用于绘制
+                            let to_win = |ix: i32, iy: i32| -> (i32,i32) {
+                                let wx = x + (ix * scaled_width) / state.current_width;
+                                let wy = y + (iy * scaled_height) / state.current_height;
+                                (wx, wy)
+                            };
+                            let (wx1, wy1) = to_win(sx, sy);
+                            let (wx2, wy2) = to_win(ex, ey);
+                            let left = wx1.min(wx2);
+                            let top = wy1.min(wy2);
+                            let right = wx1.max(wx2);
+                            let bottom = wy1.max(wy2);
+                            
+                            // 绘制绿色选框（2像素宽）
+                            let pen = CreatePen(PS_SOLID as i32, 2, RGB(0,255,0));
+                            let old_pen = SelectObject(mem_dc, pen as HGDIOBJ);
+                            let hollow_brush = GetStockObject(HOLLOW_BRUSH as i32) as HBRUSH;
+                            let old_brush = SelectObject(mem_dc, hollow_brush as HGDIOBJ);
+                            Rectangle(mem_dc, left, top, right, bottom);
+                            SelectObject(mem_dc, old_pen);
+                            SelectObject(mem_dc, old_brush);
+                            DeleteObject(pen as HGDIOBJ);
+                            
+                            // 在选框上方显示尺寸信息
+                            let size_text = format!("{} x {}", right - left, bottom - top);
+                            let size_text_utf16: Vec<u16> = size_text.encode_utf16().chain(std::iter::once(0)).collect();
+                            SetTextColor(mem_dc, RGB(0, 255, 0));
+                            SetBkMode(mem_dc, TRANSPARENT as i32);
+                            SetBkColor(mem_dc, RGB(0, 0, 0));
+                            TextOutW(mem_dc, left, top - 20, size_text_utf16.as_ptr(), size_text.len() as i32);
                         }
                     }
                     
@@ -1491,4 +1641,69 @@ fn main() {
             DispatchMessageW(&msg);
         }
     }
+}
+
+// 新增：选框工具功能
+fn start_selection_tool(state: &mut ImageState) -> Result<()> {
+    if !state.has_image() {
+        return Err(anyhow::anyhow!("没有可用的图像，请先加载图像"));
+    }
+    
+    state.start_selection_mode();
+    Ok(())
+}
+
+// 新增：裁剪选框区域功能
+fn crop_selection_area(state: &mut ImageState) -> Result<()> {
+    use opencv::{imgproc, core as cvcore};
+    
+    if !state.has_selection() {
+        return Err(anyhow::anyhow!("没有可用的选框，请先使用选框工具框选区域"));
+    }
+    
+    let current_img = match &state.current_mat {
+        Some(img) => img,
+        None => {
+            return Err(anyhow::anyhow!("没有可用的图像"));
+        }
+    };
+    
+    let (left, top, right, bottom) = state.get_selection_rect().unwrap();
+    
+    println!("🔍 开始裁剪选框区域...");
+    println!("  选框区域: ({},{}) -> ({},{})", left, top, right, bottom);
+    println!("  选框尺寸: {}x{}", right - left, bottom - top);
+    println!("  原图尺寸: {}x{}", current_img.cols(), current_img.rows());
+    
+    // 确保选框坐标在图像范围内
+    let left = left.max(0).min(current_img.cols() - 1);
+    let top = top.max(0).min(current_img.rows() - 1);
+    let right = right.max(left + 1).min(current_img.cols());
+    let bottom = bottom.max(top + 1).min(current_img.rows());
+    
+    println!("  调整后选框区域: ({},{}) -> ({},{})", left, top, right, bottom);
+    println!("  调整后选框尺寸: {}x{}", right - left, bottom - top);
+    
+    // 创建ROI矩形
+    let roi = cvcore::Rect::new(left, top, right - left, bottom - top);
+    
+    // 裁剪图像
+    let cropped_img = match Mat::roi(current_img, roi) {
+        Ok(roi_mat) => roi_mat.try_clone()?,
+        Err(_) => {
+            return Err(anyhow::anyhow!("裁剪图像失败，ROI超出边界"));
+        }
+    };
+    
+    println!("  裁剪后图像尺寸: {}x{}", cropped_img.cols(), cropped_img.rows());
+    println!("  裁剪后图像通道数: {}", cropped_img.channels());
+    
+    // 更新显示
+    state.update_display_from_mat(&cropped_img)?;
+    
+    // 退出选框模式
+    state.end_selection_mode();
+    
+    println!("✅ 选框区域裁剪完成");
+    Ok(())
 }
