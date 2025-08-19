@@ -2190,6 +2190,14 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
             original_aspect_ratio: current_width as f64 / current_height as f64, // 新增：原始宽高比
             aspect_ratio_locked: true, // 新增：默认锁定宽高比
         });
+        
+        // 验证存储的状态
+        if let Some(ref dialog_state) = DIALOG_STATE {
+            println!("DIALOG_STATE 初始化完成:");
+            println!("  - new_info_label 句柄: {:?}", dialog_state.new_info_label);
+            println!("  - 原始宽高比: {}", dialog_state.original_aspect_ratio);
+            println!("  - 宽高比锁定: {}", dialog_state.aspect_ratio_locked);
+        }
     }
     
     println!("所有控件创建完成，开始设置对话框为模态");
@@ -2295,6 +2303,18 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
                                                 let width_text_utf16: Vec<u16> = width_text.encode_utf16().chain(std::iter::once(0)).collect();
                                                 SetWindowTextW(width_edit, width_text_utf16.as_ptr());
                                                 println!("高度变化: {} -> 宽度自动调整为: {}", new_height, new_width);
+                                                
+                                                // 更新信息标签显示新的尺寸
+                                                let new_info_text = format!("新建: {} x {} 像素", new_width, new_height);
+                                                let new_info_text_utf16: Vec<u16> = new_info_text.encode_utf16().chain(std::iter::once(0)).collect();
+                                                println!("[EN_CHANGE高度] 准备更新信息标签，新文本: '{}', 标签句柄: {:?}", new_info_text, dialog_state.new_info_label);
+                                                let result = SetWindowTextW(dialog_state.new_info_label, new_info_text_utf16.as_ptr());
+                                                println!("[EN_CHANGE高度] SetWindowTextW 结果: {}", if result == 0 { "失败" } else { "成功" });
+                                                
+                                                // 强制重绘标签
+                                                InvalidateRect(dialog_state.new_info_label, null_mut(), 1);
+                                                UpdateWindow(dialog_state.new_info_label);
+                                                println!("[EN_CHANGE高度] 已强制重绘标签");
                                             }
                                         }
                                     }
@@ -2324,6 +2344,18 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
                                                 let height_text_utf16: Vec<u16> = height_text.encode_utf16().chain(std::iter::once(0)).collect();
                                                 SetWindowTextW(height_edit, height_text_utf16.as_ptr());
                                                 println!("宽度变化: {} -> 高度自动调整为: {}", new_width, new_height);
+                                                
+                                                // 更新信息标签显示新的尺寸
+                                                let new_info_text = format!("新建: {} x {} 像素", new_width, new_height);
+                                                let new_info_text_utf16: Vec<u16> = new_info_text.encode_utf16().chain(std::iter::once(0)).collect();
+                                                println!("[EN_CHANGE宽度] 准备更新信息标签，新文本: '{}', 标签句柄: {:?}", new_info_text, dialog_state.new_info_label);
+                                                let result = SetWindowTextW(dialog_state.new_info_label, new_info_text_utf16.as_ptr());
+                                                println!("[EN_CHANGE宽度] SetWindowTextW 结果: {}", if result == 0 { "失败" } else { "成功" });
+                                                
+                                                // 强制重绘标签
+                                                InvalidateRect(dialog_state.new_info_label, null_mut(), 1);
+                                                UpdateWindow(dialog_state.new_info_label);
+                                                println!("[EN_CHANGE宽度] 已强制重绘标签");
                                             }
                                         }
                                     }
@@ -2369,6 +2401,18 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
                                             let width_text_utf16: Vec<u16> = width_text.encode_utf16().chain(std::iter::once(0)).collect();
                                             SetWindowTextW(width_edit, width_text_utf16.as_ptr());
                                             println!("高度变化: {} -> 宽度自动调整为: {}", new_height, new_width);
+                                            
+                                            // 更新信息标签显示新的尺寸
+                                            let new_info_text = format!("新建: {} x {} 像素", new_width, new_height);
+                                            let new_info_text_utf16: Vec<u16> = new_info_text.encode_utf16().chain(std::iter::once(0)).collect();
+                                            println!("[WM_CHAR高度] 准备更新信息标签，新文本: '{}', 标签句柄: {:?}", new_info_text, dialog_state.new_info_label);
+                                            let result = SetWindowTextW(dialog_state.new_info_label, new_info_text_utf16.as_ptr());
+                                            println!("[WM_CHAR高度] SetWindowTextW 结果: {}", if result == 0 { "失败" } else { "成功" });
+                                            
+                                            // 强制重绘标签
+                                            InvalidateRect(dialog_state.new_info_label, null_mut(), 1);
+                                            UpdateWindow(dialog_state.new_info_label);
+                                            println!("[WM_CHAR高度] 已强制重绘标签");
                                         }
                                     }
                                 }
@@ -2396,6 +2440,18 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
                                             let height_text_utf16: Vec<u16> = height_text.encode_utf16().chain(std::iter::once(0)).collect();
                                             SetWindowTextW(height_edit, height_text_utf16.as_ptr());
                                             println!("宽度变化: {} -> 高度自动调整为: {}", new_width, new_height);
+                                            
+                                            // 更新信息标签显示新的尺寸
+                                            let new_info_text = format!("新建: {} x {} 像素", new_width, new_height);
+                                            let new_info_text_utf16: Vec<u16> = new_info_text.encode_utf16().chain(std::iter::once(0)).collect();
+                                            println!("[WM_CHAR宽度] 准备更新信息标签，新文本: '{}', 标签句柄: {:?}", new_info_text, dialog_state.new_info_label);
+                                            let result = SetWindowTextW(dialog_state.new_info_label, new_info_text_utf16.as_ptr());
+                                            println!("[WM_CHAR宽度] SetWindowTextW 结果: {}", if result == 0 { "失败" } else { "成功" });
+                                            
+                                            // 强制重绘标签
+                                            InvalidateRect(dialog_state.new_info_label, null_mut(), 1);
+                                            UpdateWindow(dialog_state.new_info_label);
+                                            println!("[WM_CHAR宽度] 已强制重绘标签");
                                         }
                                     }
                                 }
