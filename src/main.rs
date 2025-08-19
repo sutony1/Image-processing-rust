@@ -1,8 +1,9 @@
 use std::ptr::null_mut;
-use winapi::um::winuser::*;
+use winapi::um::winuser::{*, EnableWindow, SetForegroundWindow, LoadCursorW, IDC_ARROW, COLOR_WINDOW, CS_HREDRAW, CS_VREDRAW, UnregisterClassW};
 use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::wingdi::*;
 use winapi::um::commdlg::*;
+
 use winapi::shared::windef::*;
 use winapi::shared::minwindef::*;
 use winapi::um::shellscalingapi::*;
@@ -35,9 +36,47 @@ const MENU_SAM_EXTRACT_MASK: u32 = 1015; // 新增：抠图并显示
 // 新增：选框工具和裁剪菜单
 const MENU_SELECTION_TOOL: u32 = 1016; // 选框工具
 const MENU_CROP_SELECTION: u32 = 1017; // 裁剪选框区域
+// 新增：调整图像大小菜单
+const MENU_RESIZE_IMAGE: u32 = 1018; // 调整图像大小
+
+// 滑块控件常量
+const TBS_HORZ: u32 = 0x0000;
+const TBS_AUTOTICKS: u32 = 0x0001;
+const TBM_SETRANGE: u32 = WM_USER + 6;
+const TBM_SETPOS: u32 = WM_USER + 5;
+const TBM_GETPOS: u32 = WM_USER + 0;
+
+// 对话框控件ID
+const IDC_SAVE_BUTTON: i32 = 1005;
+const IDC_CANCEL_BUTTON: i32 = 1006;
+
+// 调整图像大小对话框结果
+#[derive(Debug, Clone)]
+struct ResizeResult {
+    new_width: i32,
+    new_height: i32,
+    quality: i32,
+}
+
+// 对话框状态管理
+struct DialogState {
+    hwnd: HWND,
+    width_edit: HWND,
+    height_edit: HWND,
+    quality_trackbar: HWND,
+    quality_label: HWND,
+    new_info_label: HWND,
+    is_active: bool,
+    parent_hwnd: HWND,
+}
 
 // 全局变量存储图像数据
+#[allow(static_mut_refs)]
 static mut IMAGE_STATE: Option<ImageState> = None;
+
+// 全局对话框状态
+#[allow(static_mut_refs)]
+static mut DIALOG_STATE: Option<DialogState> = None;
 
 struct ImageState {
     original_bgr: Option<core::Mat>,
@@ -322,6 +361,13 @@ unsafe fn create_menu() -> HMENU {
     let restore_utf16: Vec<u16> = restore_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(process_menu, MF_STRING, MENU_RESTORE as usize, restore_utf16.as_ptr());
     
+    AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
+    
+    // 调整图像大小
+    let resize_text = "调整图像大小(&I)";
+    let resize_utf16: Vec<u16> = resize_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(process_menu, MF_STRING, MENU_RESIZE_IMAGE as usize, resize_utf16.as_ptr());
+    
     // 添加菜单到菜单栏
     let file_text = "文件(&F)";
     let file_utf16: Vec<u16> = file_text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -528,7 +574,7 @@ fn overlay_mask_on_current(state: &mut ImageState, mask: &[u8], mask_w: i32, mas
     mask_resized.convert_to(&mut mask_bin, cvcore::CV_8UC1, 255.0, 0.0)?;
 
     // 生成纯色覆盖图
-    let mut color_overlay = cvcore::Mat::new_rows_cols_with_default(state.current_height, state.current_width, cvcore::CV_8UC3, cvcore::Scalar::new(0.0, 255.0, 0.0, 0.0))?; // 绿色
+    let color_overlay = cvcore::Mat::new_rows_cols_with_default(state.current_height, state.current_width, cvcore::CV_8UC3, cvcore::Scalar::new(0.0, 255.0, 0.0, 0.0))?; // 绿色
     let mut blended = cvcore::Mat::default();
     cvcore::add_weighted(&color_overlay, 0.4, current, 0.6, 0.0, &mut blended, -1)?;
 
@@ -715,7 +761,7 @@ fn extract_mask_and_display(state: &mut ImageState) -> Result<()> {
         for x in 0..3.min(cropped_img.cols()) {
             let mask_val = unsafe { *resized_mask.ptr_2d(y, x)? };
             // 对于BGR三通道图像，使用正确的像素访问方式
-            let pixel_ptr = unsafe { cropped_img.ptr_2d(y, x)? };
+            let pixel_ptr = cropped_img.ptr_2d(y, x)?;
             let b_val = unsafe { *pixel_ptr };
             let g_val = unsafe { *pixel_ptr.add(1) };
             let r_val = unsafe { *pixel_ptr.add(2) };
@@ -728,8 +774,8 @@ fn extract_mask_and_display(state: &mut ImageState) -> Result<()> {
             let mask_val = unsafe { *resized_mask.ptr_2d(y, x)? };
             if mask_val > 0 {
                 // 复制原图像素到结果图
-                let src_pixel_ptr = unsafe { cropped_img.ptr_2d(y, x)? };
-                let dst_pixel_ptr = unsafe { result.ptr_2d_mut(y, x)? };
+                let src_pixel_ptr = cropped_img.ptr_2d(y, x)?;
+                let dst_pixel_ptr = result.ptr_2d_mut(y, x)?;
                 unsafe { 
                     *dst_pixel_ptr = *src_pixel_ptr;
                     *dst_pixel_ptr.add(1) = *src_pixel_ptr.add(1);
@@ -757,7 +803,7 @@ fn extract_mask_and_display(state: &mut ImageState) -> Result<()> {
     println!("  结果图像样本像素检查（前3x3区域）:");
     for y in 0..3.min(result.rows()) {
         for x in 0..3.min(result.cols()) {
-            let pixel_ptr = unsafe { result.ptr_2d(y, x)? };
+            let pixel_ptr = result.ptr_2d(y, x)?;
             let b_val = unsafe { *pixel_ptr };
             let g_val = unsafe { *pixel_ptr.add(1) };
             let r_val = unsafe { *pixel_ptr.add(2) };
@@ -1110,6 +1156,43 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                     println!("✅ 恢复原图完成");
                     InvalidateRect(hwnd, null_mut(), 1);
                 }
+            }
+        }
+        MENU_RESIZE_IMAGE => {
+            println!("用户点击了调整图像大小菜单");
+            if let Some(ref current) = state.current_mat.clone() {
+                println!("当前图像存在，尺寸: {}x{}", state.current_width, state.current_height);
+                println!("准备调用 show_resize_dialog 函数");
+                if let Some(result) = show_resize_dialog(hwnd, state.current_width, state.current_height) {
+                    println!("对话框返回结果: {:?}", result);
+                    println!("开始调用 resize_image 函数");
+                    match resize_image(current, result.new_width, result.new_height, result.quality) {
+                        Ok(resized) => {
+                            println!("图像调整成功，开始更新显示");
+                            if let Ok(()) = state.update_display_from_mat(&resized) {
+                                println!("✅ 图像大小调整完成: {}x{} -> {}x{}", 
+                                    state.current_width, state.current_height, 
+                                    result.new_width, result.new_height);
+                                InvalidateRect(hwnd, null_mut(), 1);
+                            }
+                        }
+                        Err(e) => {
+                            println!("❌ 图像大小调整失败: {}", e);
+                            let error_msg = format!("图像大小调整失败：\n{}", e);
+                            let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                            let title_utf16: Vec<u16> = "调整失败".encode_utf16().chain(std::iter::once(0)).collect();
+                            MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                        }
+                    }
+                } else {
+                    println!("对话框返回 None，用户可能取消了操作");
+                }
+            } else {
+                println!("没有可用的图像");
+                let msg = "没有可用的图像，请先加载图像";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
             }
         }
         MENU_SAM_ENCODE => {
@@ -1706,4 +1789,535 @@ fn crop_selection_area(state: &mut ImageState) -> Result<()> {
     
     println!("✅ 选框区域裁剪完成");
     Ok(())
+}
+
+// 显示调整图像大小对话框
+unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32) -> Option<ResizeResult> {
+    println!("开始创建调整图像大小对话框");
+    println!("主窗口句柄: {:?}, 当前图像尺寸: {}x{}", hwnd, current_width, current_height);
+    
+    // 注册对话框窗口类
+    let dialog_class = "ResizeDialogClass";
+    let dialog_class_utf16: Vec<u16> = dialog_class.encode_utf16().chain(std::iter::once(0)).collect();
+    
+    let wc = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(dialog_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: GetModuleHandleW(null_mut()),
+        hIcon: null_mut(),
+        hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+        hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
+        lpszMenuName: null_mut(),
+        lpszClassName: dialog_class_utf16.as_ptr(),
+    };
+    
+    if RegisterClassW(&wc) == 0 {
+        println!("错误：无法注册对话框窗口类");
+        return None;
+    }
+    
+    // 创建模态对话框窗口
+    let dialog_hwnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        dialog_class_utf16.as_ptr(),
+        null_mut(),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | DS_MODALFRAME,
+        100, 100, 400, 500, // 位置和大小
+        hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if dialog_hwnd.is_null() {
+        println!("错误：无法创建对话框窗口");
+        return None;
+    }
+    
+    println!("对话框窗口创建成功，句柄: {:?}", dialog_hwnd);
+    
+    // 设置对话框标题
+    let title = "重设大小";
+    let title_utf16: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(dialog_hwnd, title_utf16.as_ptr());
+    println!("对话框标题设置完成");
+    
+    // 创建控件
+    let mut result = ResizeResult {
+        new_width: current_width,
+        new_height: current_height,
+        quality: 80,
+    };
+    println!("ResizeResult 结构体初始化完成");
+    
+    // 创建宽度输入框标签
+    let static_class = "STATIC";
+    let static_class_utf16: Vec<u16> = static_class.encode_utf16().chain(std::iter::once(0)).collect();
+    let width_label = CreateWindowExW(
+        0,
+        static_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        20, 50, 80, 20,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if width_label.is_null() {
+        println!("错误：无法创建宽度标签");
+        return None;
+    }
+    
+    let width_label_text = "宽度 (px):";
+    let width_label_text_utf16: Vec<u16> = width_label_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(width_label, width_label_text_utf16.as_ptr());
+    println!("宽度标签创建成功");
+    
+    // 创建宽度输入框
+    let edit_class = "EDIT";
+    let edit_class_utf16: Vec<u16> = edit_class.encode_utf16().chain(std::iter::once(0)).collect();
+    let width_edit = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        edit_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+        110, 50, 100, 20,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if width_edit.is_null() {
+        println!("错误：无法创建宽度输入框");
+        return None;
+    }
+    
+    let width_text = format!("{}", current_width);
+    let width_text_utf16: Vec<u16> = width_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(width_edit, width_text_utf16.as_ptr());
+    println!("宽度输入框创建成功，初始值: {}", current_width);
+    
+    // 创建高度输入框标签
+    let height_label = CreateWindowExW(
+        0,
+        static_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        20, 80, 80, 20,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if height_label.is_null() {
+        println!("错误：无法创建高度标签");
+        return None;
+    }
+    
+    let height_label_text = "高度 (px):";
+    let height_label_text_utf16: Vec<u16> = height_label_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(height_label, height_label_text_utf16.as_ptr());
+    println!("高度标签创建成功");
+    
+    // 创建高度输入框
+    let height_edit = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        edit_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+        110, 80, 100, 20,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if height_edit.is_null() {
+        println!("错误：无法创建高度输入框");
+        return None;
+    }
+    
+    let height_text = format!("{}", current_height);
+    let height_text_utf16: Vec<u16> = height_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(height_edit, height_text_utf16.as_ptr());
+    println!("高度输入框创建成功，初始值: {}", current_height);
+    
+    // 创建质量标签
+    let quality_label = CreateWindowExW(
+        0,
+        static_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        20, 120, 100, 20,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if quality_label.is_null() {
+        println!("错误：无法创建质量标签");
+        return None;
+    }
+    
+    let quality_label_text = "质量: 80% (高)";
+    let quality_label_text_utf16: Vec<u16> = quality_label_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(quality_label, quality_label_text_utf16.as_ptr());
+    println!("质量标签创建成功");
+    
+    // 创建质量滑块
+    let msctls_trackbar32_class = "msctls_trackbar32";
+    let msctls_trackbar32_class_utf16: Vec<u16> = msctls_trackbar32_class.encode_utf16().chain(std::iter::once(0)).collect();
+    let quality_trackbar = CreateWindowExW(
+        0,
+        msctls_trackbar32_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | TBS_HORZ | TBS_AUTOTICKS,
+        20, 150, 200, 30,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if quality_trackbar.is_null() {
+        println!("错误：无法创建质量滑块");
+        return None;
+    }
+    
+    // 设置滑块范围 (1-100)
+    SendMessageW(quality_trackbar, TBM_SETRANGE, 1, 100);
+    SendMessageW(quality_trackbar, TBM_SETPOS, 1, 80);
+    println!("质量滑块创建成功，范围: 1-100, 初始值: 80");
+    
+    // 创建文件类型标签
+    let filetype_label = CreateWindowExW(
+        0,
+        static_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        20, 200, 80, 20,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if filetype_label.is_null() {
+        println!("错误：无法创建文件类型标签");
+        return None;
+    }
+    
+    let filetype_label_text = "文件类型:";
+    let filetype_label_text_utf16: Vec<u16> = filetype_label_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(filetype_label, filetype_label_text_utf16.as_ptr());
+    println!("文件类型标签创建成功");
+    
+    // 创建文件类型下拉框
+    let combobox_class = "COMBOBOX";
+    let combobox_class_utf16: Vec<u16> = combobox_class.encode_utf16().chain(std::iter::once(0)).collect();
+    let filetype_combo = CreateWindowExW(
+        0,
+        combobox_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+        110, 200, 100, 100,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if filetype_combo.is_null() {
+        println!("错误：无法创建文件类型下拉框");
+        return None;
+    }
+    
+    // 添加文件类型选项
+    let jpg_text = "JPG";
+    let jpg_text_utf16: Vec<u16> = jpg_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SendMessageW(filetype_combo, CB_ADDSTRING, 0, jpg_text_utf16.as_ptr() as LPARAM);
+    SendMessageW(filetype_combo, CB_SETCURSEL, 0, 0);
+    println!("文件类型下拉框创建成功，添加了JPG选项");
+    
+    // 创建当前图像信息标签
+    let current_info_label = CreateWindowExW(
+        0,
+        static_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        20, 250, 350, 40,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if current_info_label.is_null() {
+        println!("错误：无法创建当前图像信息标签");
+        return None;
+    }
+    
+    let current_info_text = format!("当前: {} x {} 像素", current_width, current_height);
+    let current_info_text_utf16: Vec<u16> = current_info_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(current_info_label, current_info_text_utf16.as_ptr());
+    println!("当前图像信息标签创建成功");
+    
+    // 创建新图像信息标签
+    let new_info_label = CreateWindowExW(
+        0,
+        static_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        20, 290, 350, 40,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if new_info_label.is_null() {
+        println!("错误：无法创建新图像信息标签");
+        return None;
+    }
+    
+    let new_info_text = format!("新建: {} x {} 像素", current_width, current_height);
+    let new_info_text_utf16: Vec<u16> = new_info_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(new_info_label, new_info_text_utf16.as_ptr());
+    println!("新图像信息标签创建成功");
+    
+    // 创建保存按钮
+    let button_class = "BUTTON";
+    let button_class_utf16: Vec<u16> = button_class.encode_utf16().chain(std::iter::once(0)).collect();
+    let save_button = CreateWindowExW(
+        0,
+        button_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+        20, 350, 80, 30,
+        dialog_hwnd,
+        IDC_SAVE_BUTTON as HMENU,
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if save_button.is_null() {
+        println!("错误：无法创建保存按钮");
+        return None;
+    }
+    
+    let save_text = "保存";
+    let save_text_utf16: Vec<u16> = save_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(save_button, save_text_utf16.as_ptr());
+    println!("保存按钮创建成功");
+    
+    // 创建取消按钮
+    let cancel_button = CreateWindowExW(
+        0,
+        button_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+        120, 350, 80, 30,
+        dialog_hwnd,
+        IDC_CANCEL_BUTTON as HMENU,
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if cancel_button.is_null() {
+        println!("错误：无法创建取消按钮");
+        return None;
+    }
+    
+    let cancel_text = "取消";
+    let cancel_text_utf16: Vec<u16> = cancel_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(cancel_button, cancel_text_utf16.as_ptr());
+    println!("取消按钮创建成功");
+    
+    // 存储控件句柄到全局状态
+    unsafe {
+        DIALOG_STATE = Some(DialogState {
+            hwnd: dialog_hwnd,
+            width_edit,
+            height_edit,
+            quality_trackbar,
+            quality_label,
+            new_info_label,
+            is_active: true,
+            parent_hwnd: hwnd,
+        });
+    }
+    
+    println!("所有控件创建完成，开始设置对话框为模态");
+    
+    // 设置对话框为模态
+    println!("禁用主窗口");
+    EnableWindow(hwnd, 0);
+    println!("设置对话框为前台窗口");
+    SetForegroundWindow(dialog_hwnd);
+    
+    println!("开始进入消息循环");
+    let mut message_count = 0;
+    
+    // 消息循环处理对话框
+    let mut msg: MSG = std::mem::zeroed();
+    let mut dialog_result = None;
+    let mut should_exit = false;
+    
+    while !should_exit && GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+        message_count += 1;
+        if message_count % 100 == 0 {
+            println!("已处理 {} 条消息", message_count);
+        }
+        
+        println!("收到消息: 类型={}, 窗口={:?}, 参数={:?}", msg.message, msg.hwnd, msg.wParam);
+        
+        // 转发所有消息，确保主窗口能正常响应
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+        
+        // 只在对话框相关消息时处理保存/取消逻辑
+        if msg.hwnd == dialog_hwnd || IsChild(dialog_hwnd, msg.hwnd) != 0 {
+            println!("处理对话框相关消息");
+            
+            // 检查按钮点击
+            if msg.message == WM_COMMAND {
+                let control_id = (msg.wParam & 0xFFFF) as i32;
+                println!("收到 WM_COMMAND 消息，控件ID: {}", control_id);
+                
+                if control_id == IDC_SAVE_BUTTON {
+                    println!("保存按钮被点击");
+                    // 获取输入框的值
+                    let mut text_len = SendMessageW(width_edit, WM_GETTEXTLENGTH, 0, 0);
+                    if text_len > 0 {
+                        let mut buffer = vec![0u16; text_len as usize + 1];
+                        SendMessageW(width_edit, WM_GETTEXT, buffer.len(), buffer.as_mut_ptr() as LPARAM);
+                        if let Ok(width_str) = String::from_utf16(&buffer[..text_len as usize]) {
+                            if let Ok(width) = width_str.parse::<i32>() {
+                                result.new_width = width;
+                                println!("设置新宽度: {}", width);
+                            }
+                        }
+                    }
+                    
+                    text_len = SendMessageW(height_edit, WM_GETTEXTLENGTH, 0, 0);
+                    if text_len > 0 {
+                        let mut buffer = vec![0u16; text_len as usize + 1];
+                        SendMessageW(height_edit, WM_GETTEXT, buffer.len(), buffer.as_mut_ptr() as LPARAM);
+                        if let Ok(height_str) = String::from_utf16(&buffer[..text_len as usize]) {
+                            if let Ok(height) = height_str.parse::<i32>() {
+                                result.new_height = height;
+                                println!("设置新高度: {}", height);
+                            }
+                        }
+                    }
+                    
+                    // 获取滑块值
+                    let quality = SendMessageW(quality_trackbar, TBM_GETPOS, 0, 0) as i32;
+                    result.quality = quality;
+                    println!("设置新质量: {}", quality);
+                    
+                    dialog_result = Some(result.clone());
+                    should_exit = true;
+                    println!("保存操作完成，准备退出对话框");
+                } else if control_id == IDC_CANCEL_BUTTON {
+                    println!("取消按钮被点击，准备退出对话框");
+                    should_exit = true;
+                }
+            }
+            
+            // 处理对话框关闭消息
+            if msg.message == WM_CLOSE && msg.hwnd == dialog_hwnd {
+                println!("收到对话框关闭消息");
+                should_exit = true;
+            }
+        } else if msg.message == WM_QUIT {
+            // 重新发送退出消息并退出对话框
+            println!("收到 WM_QUIT 消息，重新发送并退出对话框");
+            PostQuitMessage(msg.wParam as i32);
+            should_exit = true;
+        }
+    }
+    
+    println!("消息循环结束，should_exit: {}", should_exit);
+    
+    // 恢复主窗口
+    println!("恢复主窗口状态");
+    EnableWindow(hwnd, 1);
+    
+    // 清理全局状态
+    unsafe {
+        DIALOG_STATE = None;
+    }
+    
+    // 销毁对话框
+    println!("销毁对话框窗口");
+    DestroyWindow(dialog_hwnd);
+    
+    // 注销窗口类
+    UnregisterClassW(dialog_class_utf16.as_ptr(), GetModuleHandleW(null_mut()));
+    
+    println!("对话框销毁完成，返回结果: {:?}", dialog_result);
+    dialog_result
+}
+
+// 对话框窗口过程函数
+unsafe extern "system" fn dialog_proc(
+    hwnd: HWND,
+    msg: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            let control_id = (wparam & 0xFFFF) as i32;
+            if control_id == IDC_SAVE_BUTTON || control_id == IDC_CANCEL_BUTTON {
+                // 发送消息到主窗口的消息循环
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// 调整图像大小
+fn resize_image(mat: &core::Mat, new_width: i32, new_height: i32, quality: i32) -> Result<core::Mat> {
+    use opencv::imgproc;
+    
+    if new_width <= 0 || new_height <= 0 {
+        return Err(anyhow::anyhow!("无效的尺寸: {}x{}", new_width, new_height));
+    }
+    
+    if quality < 1 || quality > 100 {
+        return Err(anyhow::anyhow!("无效的质量值: {}", quality));
+    }
+    
+    // 使用OpenCV的resize函数调整图像大小
+    let mut resized = core::Mat::default();
+    let size = core::Size::new(new_width, new_height);
+    
+    imgproc::resize(
+        mat,
+        &mut resized,
+        size,
+        0.0,
+        0.0,
+        imgproc::INTER_LINEAR,
+    )?;
+    
+    Ok(resized)
 }

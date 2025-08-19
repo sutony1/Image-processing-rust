@@ -246,7 +246,7 @@ impl SAMProcessor {
         println!("    创建mask Mat: {}x{}", h, w);
 
         // 直接使用模型输出的mask，不需要上采样
-        let mut mask_to_resize = mask_256;
+        let mask_to_resize = mask_256;
         println!("    直接使用模型输出的mask尺寸: {}x{}", h, w);
 
         // 如果模型输出的尺寸与期望的new_w×new_h不匹配，需要调整
