@@ -46,9 +46,15 @@ const TBM_SETRANGE: u32 = WM_USER + 6;
 const TBM_SETPOS: u32 = WM_USER + 5;
 const TBM_GETPOS: u32 = WM_USER + 0;
 
+// 编辑框通知常量
+const EN_CHANGE: u16 = 0x0300;
+
 // 对话框控件ID
 const IDC_SAVE_BUTTON: i32 = 1005;
 const IDC_CANCEL_BUTTON: i32 = 1006;
+
+const IDC_WIDTH_EDIT: i32 = 1008;  // 宽度输入框ID
+const IDC_HEIGHT_EDIT: i32 = 1009; // 高度输入框ID
 
 // 调整图像大小对话框结果
 #[derive(Debug, Clone)]
@@ -63,11 +69,14 @@ struct DialogState {
     hwnd: HWND,
     width_edit: HWND,
     height_edit: HWND,
+
     quality_trackbar: HWND,
     quality_label: HWND,
     new_info_label: HWND,
     is_active: bool,
     parent_hwnd: HWND,
+    original_aspect_ratio: f64, // 新增：原始宽高比
+    aspect_ratio_locked: bool, // 新增：是否锁定宽高比
 }
 
 // 全局变量存储图像数据
@@ -1887,7 +1896,7 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
         WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
         110, 50, 100, 20,
         dialog_hwnd,
-        null_mut(),
+        IDC_WIDTH_EDIT as HMENU,
         GetModuleHandleW(null_mut()),
         null_mut(),
     );
@@ -1933,7 +1942,7 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
         WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
         110, 80, 100, 20,
         dialog_hwnd,
-        null_mut(),
+        IDC_HEIGHT_EDIT as HMENU,
         GetModuleHandleW(null_mut()),
         null_mut(),
     );
@@ -1947,6 +1956,29 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
     let height_text_utf16: Vec<u16> = height_text.encode_utf16().chain(std::iter::once(0)).collect();
     SetWindowTextW(height_edit, height_text_utf16.as_ptr());
     println!("高度输入框创建成功，初始值: {}", current_height);
+    
+    // 创建锁定符号标签 (🔒)
+    let lock_symbol_label = CreateWindowExW(
+        0,
+        static_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        220, 80, 30, 20,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if lock_symbol_label.is_null() {
+        println!("错误：无法创建锁定符号标签");
+        return None;
+    }
+    
+    let lock_symbol_text = "🔒";
+    let lock_symbol_text_utf16: Vec<u16> = lock_symbol_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(lock_symbol_label, lock_symbol_text_utf16.as_ptr());
+    println!("锁定符号标签创建成功");
     
     // 创建质量标签
     let quality_label = CreateWindowExW(
@@ -2140,17 +2172,23 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
     SetWindowTextW(cancel_button, cancel_text_utf16.as_ptr());
     println!("取消按钮创建成功");
     
+    // 移除锁定按钮相关代码，因为默认就是锁定状态
+    println!("默认锁定宽高比，无需额外按钮");
+    
     // 存储控件句柄到全局状态
     unsafe {
         DIALOG_STATE = Some(DialogState {
             hwnd: dialog_hwnd,
             width_edit,
             height_edit,
+
             quality_trackbar,
             quality_label,
             new_info_label,
             is_active: true,
             parent_hwnd: hwnd,
+            original_aspect_ratio: current_width as f64 / current_height as f64, // 新增：原始宽高比
+            aspect_ratio_locked: true, // 新增：默认锁定宽高比
         });
     }
     
@@ -2189,7 +2227,8 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
             // 检查按钮点击
             if msg.message == WM_COMMAND {
                 let control_id = (msg.wParam & 0xFFFF) as i32;
-                println!("收到 WM_COMMAND 消息，控件ID: {}", control_id);
+                let notification = (msg.wParam >> 16) as u16;
+                println!("收到 WM_COMMAND 消息，控件ID: {}, 通知码: {}", control_id, notification);
                 
                 if control_id == IDC_SAVE_BUTTON {
                     println!("保存按钮被点击");
@@ -2230,12 +2269,140 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
                     println!("取消按钮被点击，准备退出对话框");
                     should_exit = true;
                 }
+                
+                // 处理输入框变化（EN_CHANGE 通知）
+                if notification == EN_CHANGE {
+                    println!("收到 EN_CHANGE 通知，控件ID: {}", control_id);
+                    // 检查是哪个输入框发生了变化
+                    if control_id == IDC_HEIGHT_EDIT {
+                        println!("高度输入框发生变化");
+                        // 高度发生变化，如果锁定宽高比，则自动调整宽度
+                        if let Some(ref dialog_state) = DIALOG_STATE {
+                            if dialog_state.aspect_ratio_locked {
+                                println!("宽高比已锁定，开始调整宽度");
+                                // 获取新的高度值
+                                let text_len = SendMessageW(height_edit, WM_GETTEXTLENGTH, 0, 0);
+                                if text_len > 0 {
+                                    let mut buffer = vec![0u16; text_len as usize + 1];
+                                    SendMessageW(height_edit, WM_GETTEXT, buffer.len(), buffer.as_mut_ptr() as LPARAM);
+                                    if let Ok(height_str) = String::from_utf16(&buffer[..text_len as usize]) {
+                                        if let Ok(new_height) = height_str.parse::<i32>() {
+                                            if new_height > 0 {
+                                                // 根据宽高比计算新的宽度
+                                                let new_width = (new_height as f64 * dialog_state.original_aspect_ratio) as i32;
+                                                // 更新宽度输入框
+                                                let width_text = format!("{}", new_width);
+                                                let width_text_utf16: Vec<u16> = width_text.encode_utf16().chain(std::iter::once(0)).collect();
+                                                SetWindowTextW(width_edit, width_text_utf16.as_ptr());
+                                                println!("高度变化: {} -> 宽度自动调整为: {}", new_height, new_width);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                println!("宽高比未锁定，不调整宽度");
+                            }
+                        }
+                    } else if control_id == IDC_WIDTH_EDIT {
+                        println!("宽度输入框发生变化");
+                        // 宽度发生变化，如果锁定宽高比，则自动调整高度
+                        if let Some(ref dialog_state) = DIALOG_STATE {
+                            if dialog_state.aspect_ratio_locked {
+                                println!("宽高比已锁定，开始调整高度");
+                                // 获取新的宽度值
+                                let text_len = SendMessageW(width_edit, WM_GETTEXTLENGTH, 0, 0);
+                                if text_len > 0 {
+                                    let mut buffer = vec![0u16; text_len as usize + 1];
+                                    SendMessageW(width_edit, WM_GETTEXT, buffer.len(), buffer.as_mut_ptr() as LPARAM);
+                                    if let Ok(width_str) = String::from_utf16(&buffer[..text_len as usize]) {
+                                        if let Ok(new_width) = width_str.parse::<i32>() {
+                                            if new_width > 0 {
+                                                // 根据宽高比计算新的高度
+                                                let new_height = (new_width as f64 / dialog_state.original_aspect_ratio) as i32;
+                                                // 更新高度输入框
+                                                let height_text = format!("{}", new_height);
+                                                let height_text_utf16: Vec<u16> = height_text.encode_utf16().chain(std::iter::once(0)).collect();
+                                                SetWindowTextW(height_edit, height_text_utf16.as_ptr());
+                                                println!("宽度变化: {} -> 高度自动调整为: {}", new_width, new_height);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                println!("宽高比未锁定，不调整高度");
+                            }
+                        }
+                    }
+                }
             }
             
             // 处理对话框关闭消息
             if msg.message == WM_CLOSE && msg.hwnd == dialog_hwnd {
                 println!("收到对话框关闭消息");
                 should_exit = true;
+            }
+            
+            // 尝试使用 WM_CHAR 消息来检测文本输入
+            if msg.message == WM_CHAR && (msg.hwnd == width_edit || msg.hwnd == height_edit) {
+                println!("收到 WM_CHAR 消息，窗口: {:?}", msg.hwnd);
+                // 延迟处理，等待文本更新完成
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                
+                if msg.hwnd == height_edit {
+                    println!("高度输入框收到字符输入");
+                    // 高度发生变化，如果锁定宽高比，则自动调整宽度
+                    if let Some(ref dialog_state) = DIALOG_STATE {
+                        if dialog_state.aspect_ratio_locked {
+                            println!("宽高比已锁定，开始调整宽度");
+                            // 获取新的高度值
+                            let text_len = SendMessageW(height_edit, WM_GETTEXTLENGTH, 0, 0);
+                            if text_len > 0 {
+                                let mut buffer = vec![0u16; text_len as usize + 1];
+                                SendMessageW(height_edit, WM_GETTEXT, buffer.len(), buffer.as_mut_ptr() as LPARAM);
+                                if let Ok(height_str) = String::from_utf16(&buffer[..text_len as usize]) {
+                                    if let Ok(new_height) = height_str.parse::<i32>() {
+                                        if new_height > 0 {
+                                            // 根据宽高比计算新的宽度
+                                            let new_width = (new_height as f64 * dialog_state.original_aspect_ratio) as i32;
+                                            // 更新宽度输入框
+                                            let width_text = format!("{}", new_width);
+                                            let width_text_utf16: Vec<u16> = width_text.encode_utf16().chain(std::iter::once(0)).collect();
+                                            SetWindowTextW(width_edit, width_text_utf16.as_ptr());
+                                            println!("高度变化: {} -> 宽度自动调整为: {}", new_height, new_width);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if msg.hwnd == width_edit {
+                    println!("宽度输入框收到字符输入");
+                    // 宽度发生变化，如果锁定宽高比，则自动调整高度
+                    if let Some(ref dialog_state) = DIALOG_STATE {
+                        if dialog_state.aspect_ratio_locked {
+                            println!("宽高比已锁定，开始调整高度");
+                            // 获取新的宽度值
+                            let text_len = SendMessageW(width_edit, WM_GETTEXTLENGTH, 0, 0);
+                            if text_len > 0 {
+                                let mut buffer = vec![0u16; text_len as usize + 1];
+                                SendMessageW(width_edit, WM_GETTEXT, buffer.len(), buffer.as_mut_ptr() as LPARAM);
+                                if let Ok(width_str) = String::from_utf16(&buffer[..text_len as usize]) {
+                                    if let Ok(new_width) = width_str.parse::<i32>() {
+                                        if new_width > 0 {
+                                            // 根据宽高比计算新的高度
+                                            let new_height = (new_width as f64 / dialog_state.original_aspect_ratio) as i32;
+                                            // 更新高度输入框
+                                            let height_text = format!("{}", new_height);
+                                            let height_text_utf16: Vec<u16> = height_text.encode_utf16().chain(std::iter::once(0)).collect();
+                                            SetWindowTextW(height_edit, height_text_utf16.as_ptr());
+                                            println!("宽度变化: {} -> 高度自动调整为: {}", new_width, new_height);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } else if msg.message == WM_QUIT {
             // 重新发送退出消息并退出对话框
@@ -2250,6 +2417,10 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
     // 恢复主窗口
     println!("恢复主窗口状态");
     EnableWindow(hwnd, 1);
+    
+    // 确保主窗口重新获得焦点并显示在前台
+    SetForegroundWindow(hwnd);
+    ShowWindow(hwnd, SW_RESTORE);
     
     // 清理全局状态
     unsafe {
@@ -2281,6 +2452,7 @@ unsafe extern "system" fn dialog_proc(
                 // 发送消息到主窗口的消息循环
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
             }
+            // 锁定按钮不应该关闭对话框，只是切换锁定状态
             0
         }
         WM_CLOSE => {
