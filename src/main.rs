@@ -57,12 +57,20 @@ const IDC_CANCEL_BUTTON: i32 = 1006;
 const IDC_WIDTH_EDIT: i32 = 1008;  // 宽度输入框ID
 const IDC_HEIGHT_EDIT: i32 = 1009; // 高度输入框ID
 
+// 插值算法常量
+const INTER_NEAREST: i32 = 0;      // 最近邻插值
+const INTER_LINEAR: i32 = 1;       // 双线性插值（默认）
+const INTER_CUBIC: i32 = 2;        // 双三次插值
+const INTER_AREA: i32 = 3;         // 区域插值
+const INTER_LANCZOS4: i32 = 4;     // Lanczos插值
+
 // 调整图像大小对话框结果
 #[derive(Debug, Clone)]
 struct ResizeResult {
     new_width: i32,
     new_height: i32,
     quality: i32,
+    interpolation: i32, // 新增：插值算法
 }
 
 // 对话框状态管理
@@ -74,6 +82,7 @@ struct DialogState {
     quality_trackbar: HWND,
     quality_label: HWND,
     new_info_label: HWND,
+    interpolation_combo: HWND, // 新增：插值算法选择下拉框
     is_active: bool,
     parent_hwnd: HWND,
     original_aspect_ratio: f64, // 新增：原始宽高比
@@ -1840,7 +1849,7 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
         dialog_class_utf16.as_ptr(),
         null_mut(),
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | DS_MODALFRAME,
-        100, 100, 400, 500, // 位置和大小
+        100, 100, 400, 500, // 增加高度以确保按钮完全可见
         hwnd,
         null_mut(),
         GetModuleHandleW(null_mut()),
@@ -1865,6 +1874,7 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
         new_width: current_width,
         new_height: current_height,
         quality: 80,
+        interpolation: INTER_LINEAR, // 新增：插值算法
     };
     println!("ResizeResult 结构体初始化完成");
     
@@ -2035,13 +2045,81 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
     SendMessageW(quality_trackbar, TBM_SETPOS, 1, 80);
     println!("质量滑块创建成功，范围: 1-100, 初始值: 80");
     
+    // 创建插值算法标签
+    let interpolation_label = CreateWindowExW(
+        0,
+        static_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        20, 190, 100, 20,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if interpolation_label.is_null() {
+        println!("错误：无法创建插值算法标签");
+        return None;
+    }
+    
+    let interpolation_label_text = "插值算法:";
+    let interpolation_label_text_utf16: Vec<u16> = interpolation_label_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(interpolation_label, interpolation_label_text_utf16.as_ptr());
+    println!("插值算法标签创建成功");
+    
+    // 创建插值算法选择下拉框
+    let combobox_class = "COMBOBOX";
+    let combobox_class_utf16: Vec<u16> = combobox_class.encode_utf16().chain(std::iter::once(0)).collect();
+    let interpolation_combo = CreateWindowExW(
+        0,
+        combobox_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+        110, 190, 150, 100,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if interpolation_combo.is_null() {
+        println!("错误：无法创建插值算法选择下拉框");
+        return None;
+    }
+    
+    // 添加插值算法选项
+    let nearest_text = "最近邻插值 (最快)";
+    let nearest_text_utf16: Vec<u16> = nearest_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SendMessageW(interpolation_combo, CB_ADDSTRING, 0, nearest_text_utf16.as_ptr() as LPARAM);
+    
+    let linear_text = "双线性插值 (推荐)";
+    let linear_text_utf16: Vec<u16> = linear_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SendMessageW(interpolation_combo, CB_ADDSTRING, 0, linear_text_utf16.as_ptr() as LPARAM);
+    
+    let cubic_text = "双三次插值 (高质量)";
+    let cubic_text_utf16: Vec<u16> = cubic_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SendMessageW(interpolation_combo, CB_ADDSTRING, 0, cubic_text_utf16.as_ptr() as LPARAM);
+    
+    let area_text = "区域插值 (适合缩小)";
+    let area_text_utf16: Vec<u16> = area_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SendMessageW(interpolation_combo, CB_ADDSTRING, 0, area_text_utf16.as_ptr() as LPARAM);
+    
+    let lanczos_text = "Lanczos插值 (最高质量)";
+    let lanczos_text_utf16: Vec<u16> = lanczos_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SendMessageW(interpolation_combo, CB_ADDSTRING, 0, lanczos_text_utf16.as_ptr() as LPARAM);
+    
+    // 设置默认选择为双线性插值（索引1）
+    SendMessageW(interpolation_combo, CB_SETCURSEL, 1, 0);
+    println!("插值算法选择下拉框创建成功，默认选择双线性插值");
+    
     // 创建文件类型标签
     let filetype_label = CreateWindowExW(
         0,
         static_class_utf16.as_ptr(),
         null_mut(),
         WS_VISIBLE | WS_CHILD | SS_LEFT,
-        20, 200, 80, 20,
+        20, 230, 80, 20, // 调整Y坐标
         dialog_hwnd,
         null_mut(),
         GetModuleHandleW(null_mut()),
@@ -2066,7 +2144,7 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
         combobox_class_utf16.as_ptr(),
         null_mut(),
         WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-        110, 200, 100, 100,
+        110, 230, 100, 100, // 调整Y坐标
         dialog_hwnd,
         null_mut(),
         GetModuleHandleW(null_mut()),
@@ -2091,7 +2169,7 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
         static_class_utf16.as_ptr(),
         null_mut(),
         WS_VISIBLE | WS_CHILD | SS_LEFT,
-        20, 250, 350, 40,
+        20, 280, 350, 40, // 调整Y坐标
         dialog_hwnd,
         null_mut(),
         GetModuleHandleW(null_mut()),
@@ -2114,7 +2192,7 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
         static_class_utf16.as_ptr(),
         null_mut(),
         WS_VISIBLE | WS_CHILD | SS_LEFT,
-        20, 290, 350, 40,
+        20, 320, 350, 40, // 调整Y坐标
         dialog_hwnd,
         null_mut(),
         GetModuleHandleW(null_mut()),
@@ -2139,7 +2217,7 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
         button_class_utf16.as_ptr(),
         null_mut(),
         WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-        20, 350, 80, 30,
+        20, 380, 80, 30, // 调整Y坐标
         dialog_hwnd,
         IDC_SAVE_BUTTON as HMENU,
         GetModuleHandleW(null_mut()),
@@ -2162,7 +2240,7 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
         button_class_utf16.as_ptr(),
         null_mut(),
         WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-        120, 350, 80, 30,
+        120, 380, 80, 30, // 调整Y坐标
         dialog_hwnd,
         IDC_CANCEL_BUTTON as HMENU,
         GetModuleHandleW(null_mut()),
@@ -2192,6 +2270,7 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
             quality_trackbar,
             quality_label,
             new_info_label,
+            interpolation_combo, // 新增：插值算法选择下拉框
             is_active: true,
             parent_hwnd: hwnd,
             original_aspect_ratio: current_width as f64 / current_height as f64, // 新增：原始宽高比
@@ -2402,11 +2481,32 @@ unsafe extern "system" fn dialog_proc(
                     let quality = SendMessageW(dialog_state.quality_trackbar, TBM_GETPOS, 0, 0) as i32;
                     println!("[dialog_proc] 设置新质量: {}", quality);
                     
+                    // 获取选择的插值算法
+                    let interpolation_index = SendMessageW(dialog_state.interpolation_combo, CB_GETCURSEL, 0, 0) as i32;
+                    let interpolation = match interpolation_index {
+                        0 => INTER_NEAREST,
+                        1 => INTER_LINEAR,
+                        2 => INTER_CUBIC,
+                        3 => INTER_AREA,
+                        4 => INTER_LANCZOS4,
+                        _ => INTER_LINEAR, // 默认使用双线性插值
+                    };
+                    println!("[dialog_proc] 选择的插值算法: {} (索引: {})", 
+                        match interpolation {
+                            INTER_NEAREST => "最近邻插值",
+                            INTER_LINEAR => "双线性插值",
+                            INTER_CUBIC => "双三次插值",
+                            INTER_AREA => "区域插值",
+                            INTER_LANCZOS4 => "Lanczos插值",
+                            _ => "未知算法",
+                        }, interpolation_index);
+                    
                     // 创建结果对象
                     let result = ResizeResult {
                         new_width,
                         new_height,
                         quality,
+                        interpolation, // 使用选择的插值算法
                     };
                     
                     // 显示保存文件对话框，预填原图像文件名
@@ -2473,11 +2573,45 @@ unsafe extern "system" fn dialog_proc(
                                 let save_path = String::from_utf16_lossy(&file_name[..len]);
                                 println!("[dialog_proc] 用户选择保存路径: {}", save_path);
                                 
-                                // 设置对话框结果并退出
-                                dialog_state.dialog_result = Some(result.clone());
-                                dialog_state.should_exit = true;
-                                println!("[dialog_proc] 保存操作完成，设置退出标志");
-                                PostMessageW(hwnd, WM_CLOSE, 0, 0); // 发送WM_CLOSE退出对话框
+                                // 实际保存图像
+                                if let Some(ref state) = IMAGE_STATE {
+                                    if let Some(ref current_mat) = state.current_mat {
+                                        match ocv_bridge::save_resized_image(
+                                            current_mat,
+                                            result.new_width,
+                                            result.new_height,
+                                            &save_path,
+                                            result.quality,
+                                            result.interpolation,
+                                        ) {
+                                            Ok(()) => {
+                                                println!("[dialog_proc] 图像保存成功");
+                                                // 设置对话框结果并退出
+                                                dialog_state.dialog_result = Some(result.clone());
+                                                dialog_state.should_exit = true;
+                                                println!("[dialog_proc] 保存操作完成，设置退出标志");
+                                                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                                            },
+                                            Err(e) => {
+                                                println!("[dialog_proc] 图像保存失败: {}", e);
+                                                // 显示错误消息，但不退出对话框
+                                                let error_msg = format!("保存图像失败：\n{}", e);
+                                                let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                                let title_utf16: Vec<u16> = "保存失败".encode_utf16().chain(std::iter::once(0)).collect();
+                                                MessageBoxW(
+                                                    hwnd, 
+                                                    error_msg_utf16.as_ptr(), 
+                                                    title_utf16.as_ptr(), 
+                                                    MB_OK | MB_ICONERROR
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        println!("[dialog_proc] 无法获取当前图像");
+                                    }
+                                } else {
+                                    println!("[dialog_proc] 无法获取图像状态");
+                                }
                             } else {
                                 println!("[dialog_proc] GetSaveFileNameW 失败或用户取消");
                                 // 不退出对话框，让用户继续操作
