@@ -5,6 +5,7 @@ use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::wingdi::*;
 use winapi::um::commdlg::*;
 
+
 use winapi::shared::windef::*;
 use winapi::shared::minwindef::*;
 use winapi::um::shellscalingapi::*;
@@ -43,17 +44,35 @@ const MENU_RESIZE_IMAGE: u32 = 1018; // 调整图像大小
 // 滑块控件常量
 const TBS_HORZ: u32 = 0x0000;
 const TBS_AUTOTICKS: u32 = 0x0001;
-const TBM_SETRANGE: u32 = WM_USER + 6;
-const TBM_SETPOS: u32 = WM_USER + 5;
-const TBM_GETPOS: u32 = WM_USER + 0;
+const TBS_ENABLESELRANGE: u32 = 0x0020;
+
+// MAKELONG 宏定义
+macro_rules! MAKELONG {
+    ($low:expr, $high:expr) => {
+        (($low as u32) | (($high as u32) << 16)) as u32
+    };
+}
+// Trackbar 消息常量 - 使用正确的 WinAPI 值
+const TBM_SETRANGE: u32 = 0x0406; // WM_USER + 6
+const TBM_SETPOS: u32 = 0x0405;   // WM_USER + 5  
+const TBM_GETPOS: u32 = 0x0400;   // WM_USER + 0
 
 // 编辑框通知常量
 const EN_CHANGE: u16 = 0x0300;
 
+// 滚动条常量
+const SB_LINEUP: u16 = 0;
+const SB_LINEDOWN: u16 = 1;
+const SB_PAGEUP: u16 = 2;
+const SB_PAGEDOWN: u16 = 3;
+const SB_THUMBPOSITION: u16 = 4;
+const SB_THUMBTRACK: u16 = 5;
+const SB_ENDSCROLL: u16 = 8;
+
 // 对话框控件ID
 const IDC_SAVE_BUTTON: i32 = 1005;
 const IDC_CANCEL_BUTTON: i32 = 1006;
-
+const IDC_QUALITY_TRACKBAR: i32 = 1007; // 质量滑块ID
 const IDC_WIDTH_EDIT: i32 = 1008;  // 宽度输入框ID
 const IDC_HEIGHT_EDIT: i32 = 1009; // 高度输入框ID
 
@@ -1642,6 +1661,86 @@ unsafe extern "system" fn window_proc(
             EndPaint(hwnd, &ps);
             0
         }
+        WM_HSCROLL => {
+            // 处理水平滚动消息（拖动条）
+            if let Some(ref dialog_state) = DIALOG_STATE {
+                let scroll_code = (wparam & 0xFFFF) as u16; // LOWORD(wParam) - 滚动代码
+                let track_pos = (wparam >> 16) as i32;     // HIWORD(wParam) - 拇指位置
+                
+                println!("[dialog_proc] WM_HSCROLL - wparam: 0x{:X}, lparam: 0x{:X}, scroll_code: {}, track_pos: {}", wparam, lparam, scroll_code, track_pos);
+                println!("[dialog_proc] 发送消息的控件句柄(lparam): 0x{:X}", lparam as usize);
+                println!("[dialog_proc] 存储的quality_trackbar句柄: 0x{:X}", dialog_state.quality_trackbar as usize);
+                println!("[dialog_proc] 句柄是否匹配: {}", if lparam == dialog_state.quality_trackbar as isize { "是" } else { "否" });
+                
+                // 确认消息来自我们的trackbar
+                if lparam == dialog_state.quality_trackbar as isize {
+                    match scroll_code {
+                    SB_LINEUP => { // 0
+                        let current_pos = SendMessageW(dialog_state.quality_trackbar, TBM_GETPOS, 0, 0) as i32;
+                        let new_pos = (current_pos + 1).min(100);
+                        SendMessageW(dialog_state.quality_trackbar, TBM_SETPOS, 1, new_pos as isize);
+                        update_quality_label(new_pos);
+                        println!("[dialog_proc] 质量拖动条向上移动: {} -> {}", current_pos, new_pos);
+                    }
+                    SB_LINEDOWN => { // 1
+                        let current_pos = SendMessageW(dialog_state.quality_trackbar, TBM_GETPOS, 0, 0) as i32;
+                        let new_pos = (current_pos - 1).max(1);
+                        SendMessageW(dialog_state.quality_trackbar, TBM_SETPOS, 1, new_pos as isize);
+                        update_quality_label(new_pos);
+                        println!("[dialog_proc] 质量拖动条向下移动: {} -> {}", current_pos, new_pos);
+                    }
+                    SB_PAGEUP => { // 2
+                        let current_pos = SendMessageW(dialog_state.quality_trackbar, TBM_GETPOS, 0, 0) as i32;
+                        let new_pos = (current_pos + 10).min(100);
+                        SendMessageW(dialog_state.quality_trackbar, TBM_SETPOS, 1, new_pos as isize);
+                        update_quality_label(new_pos);
+                        println!("[dialog_proc] 质量拖动条向上翻页: {} -> {}", current_pos, new_pos);
+                    }
+                    SB_PAGEDOWN => { // 3
+                        let current_pos = SendMessageW(dialog_state.quality_trackbar, TBM_GETPOS, 0, 0) as i32;
+                        let new_pos = (current_pos - 10).max(1);
+                        SendMessageW(dialog_state.quality_trackbar, TBM_SETPOS, 1, new_pos as isize);
+                        update_quality_label(new_pos);
+                        println!("[dialog_proc] 质量拖动条向下翻页: {} -> {}", current_pos, new_pos);
+                    }
+                    SB_THUMBPOSITION => { // 4
+                        // track_pos now correctly holds the thumb position
+                        SendMessageW(dialog_state.quality_trackbar, TBM_SETPOS, 1, track_pos as isize);
+                        update_quality_label(track_pos);
+                        println!("[dialog_proc] 质量拖动条拖动到位置: {}", track_pos);
+                    }
+                    SB_THUMBTRACK => { // 5
+                        // track_pos now correctly holds the thumb position
+                        SendMessageW(dialog_state.quality_trackbar, TBM_SETPOS, 1, track_pos as isize);
+                        update_quality_label(track_pos);
+                        println!("[dialog_proc] 质量拖动条拖动中: {}", track_pos);
+                    }
+                    SB_ENDSCROLL => { // 8
+                        let final_pos = SendMessageW(dialog_state.quality_trackbar, TBM_GETPOS, 0, 0) as i32;
+                        update_quality_label(final_pos);
+                        println!("[dialog_proc] 质量拖动条拖动结束，最终位置: {}", final_pos);
+                    }
+                    _ => {
+                        println!("[dialog_proc] 未处理的滚动代码: {} (0x{:X})", scroll_code, scroll_code);
+                        println!("[dialog_proc] 尝试获取当前trackbar位置...");
+                        let current_pos = SendMessageW(dialog_state.quality_trackbar, TBM_GETPOS, 0, 0) as i32;
+                        println!("[dialog_proc] 当前trackbar位置: {}", current_pos);
+                    }
+                }
+                
+                // 强制重绘质量拖动条
+                InvalidateRect(dialog_state.quality_trackbar, null_mut(), 1);
+                UpdateWindow(dialog_state.quality_trackbar);
+                println!("[dialog_proc] 强制重绘质量拖动条");
+                
+                // 强制重绘整个对话框
+                InvalidateRect(dialog_state.hwnd, null_mut(), 1);
+                UpdateWindow(dialog_state.hwnd);
+                println!("[dialog_proc] 强制重绘整个对话框");
+            }
+        }
+        0
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -1820,6 +1919,8 @@ fn crop_selection_area(state: &mut ImageState) -> Result<()> {
 unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32) -> Option<ResizeResult> {
     println!("开始创建调整图像大小对话框");
     println!("主窗口句柄: {:?}, 当前图像尺寸: {}x{}", hwnd, current_width, current_height);
+    
+
     
     // 注册对话框窗口类
     let dialog_class = "ResizeDialogClass";
@@ -2027,10 +2128,10 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
         0,
         msctls_trackbar32_class_utf16.as_ptr(),
         null_mut(),
-        WS_VISIBLE | WS_CHILD | TBS_HORZ | TBS_AUTOTICKS,
+        WS_VISIBLE | WS_CHILD | TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
         20, 150, 200, 30,
         dialog_hwnd,
-        null_mut(),
+        IDC_QUALITY_TRACKBAR as HMENU,
         GetModuleHandleW(null_mut()),
         null_mut(),
     );
@@ -2041,8 +2142,14 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
     }
     
     // 设置滑块范围 (1-100)
-    SendMessageW(quality_trackbar, TBM_SETRANGE, 1, 100);
+    SendMessageW(quality_trackbar, TBM_SETRANGE, 1, MAKELONG!(1, 100) as isize);
     SendMessageW(quality_trackbar, TBM_SETPOS, 1, 80);
+    
+    
+    // 强制更新trackbar的显示
+    InvalidateRect(quality_trackbar, null_mut(), 1);
+    UpdateWindow(quality_trackbar);
+    
     println!("质量滑块创建成功，范围: 1-100, 初始值: 80");
     
     // 创建插值算法标签
@@ -2285,6 +2392,9 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
             println!("  - new_info_label 句柄: {:?}", dialog_state.new_info_label);
             println!("  - 原始宽高比: {}", dialog_state.original_aspect_ratio);
             println!("  - 宽高比锁定: {}", dialog_state.aspect_ratio_locked);
+            
+            // 立即更新质量标签显示初始值
+            update_quality_label(80);
         }
     }
     
@@ -2432,6 +2542,39 @@ unsafe fn show_resize_dialog(hwnd: HWND, current_width: i32, current_height: i32
     
     println!("对话框销毁完成，返回结果: {:?}", dialog_result);
     dialog_result
+}
+
+// 更新质量标签显示
+unsafe fn update_quality_label(quality: i32) {
+    if let Some(ref dialog_state) = DIALOG_STATE {
+        let quality_text = match quality {
+            1..=20 => format!("质量: {}% (很低)", quality),
+            21..=40 => format!("质量: {}% (低)", quality),
+            41..=60 => format!("质量: {}% (中等)", quality),
+            61..=80 => format!("质量: {}% (高)", quality),
+            81..=100 => format!("质量: {}% (很高)", quality),
+            _ => format!("质量: {}%", quality),
+        };
+        let quality_text_utf16: Vec<u16> = quality_text.encode_utf16().chain(std::iter::once(0)).collect();
+        
+        println!("[update_quality_label] 更新质量标签，质量值: {}, 文本: '{}'", quality, quality_text);
+        println!("[update_quality_label] quality_label句柄: 0x{:X}", dialog_state.quality_label as usize);
+        
+        let result = SetWindowTextW(dialog_state.quality_label, quality_text_utf16.as_ptr());
+        println!("[update_quality_label] SetWindowTextW结果: {}", if result != 0 { "成功" } else { "失败" });
+        
+        // 强制重绘标签
+        InvalidateRect(dialog_state.quality_label, null_mut(), 1);
+        UpdateWindow(dialog_state.quality_label);
+        println!("[update_quality_label] 已调用InvalidateRect和UpdateWindow强制重绘质量标签");
+        
+        // 尝试强制重绘整个对话框
+        InvalidateRect(dialog_state.hwnd, null_mut(), 1);
+        UpdateWindow(dialog_state.hwnd);
+        println!("[update_quality_label] 已调用InvalidateRect和UpdateWindow强制重绘整个对话框");
+    } else {
+        println!("[update_quality_label] 错误: DIALOG_STATE为None");
+    }
 }
 
 // 对话框窗口过程函数
