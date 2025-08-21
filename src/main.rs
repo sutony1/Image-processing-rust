@@ -9,7 +9,7 @@ use winapi::um::commdlg::*;
 use winapi::shared::windef::*;
 use winapi::shared::minwindef::*;
 use winapi::um::shellscalingapi::*;
-use opencv::{core, imgcodecs};
+use opencv::{core, imgcodecs, imgproc};
 use opencv::prelude::*;
 use anyhow::{Result, Context};
 
@@ -40,6 +40,11 @@ const MENU_SELECTION_TOOL: u32 = 1016; // 选框工具
 const MENU_CROP_SELECTION: u32 = 1017; // 裁剪选框区域
 // 新增：调整图像大小菜单
 const MENU_RESIZE_IMAGE: u32 = 1018; // 调整图像大小
+// 新增：图像旋转菜单项
+const MENU_ROTATE_180: u32 = 1019; // 180度旋转
+const MENU_ROTATE_90_CW: u32 = 1020; // 顺时针90度旋转
+const MENU_ROTATE_90_CCW: u32 = 1021; // 逆时针90度旋转
+const MENU_ROTATE_ANGLE: u32 = 1022; // 任意角度旋转
 
 // 滑块控件常量
 const TBS_HORZ: u32 = 0x0000;
@@ -411,6 +416,36 @@ unsafe fn create_menu() -> HMENU {
     let resize_text = "调整图像大小(&I)";
     let resize_utf16: Vec<u16> = resize_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(process_menu, MF_STRING, MENU_RESIZE_IMAGE as usize, resize_utf16.as_ptr());
+    
+    AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
+    
+    // 图像旋转子菜单
+    let rotation_menu = CreatePopupMenu();
+    
+    // 180度旋转
+    let rotate_180_text = "180度(&1)";
+    let rotate_180_utf16: Vec<u16> = rotate_180_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(rotation_menu, MF_STRING, MENU_ROTATE_180 as usize, rotate_180_utf16.as_ptr());
+    
+    // 顺时针90度
+    let rotate_90_cw_text = "顺时针90度(&A)";
+    let rotate_90_cw_utf16: Vec<u16> = rotate_90_cw_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(rotation_menu, MF_STRING, MENU_ROTATE_90_CW as usize, rotate_90_cw_utf16.as_ptr());
+    
+    // 逆时针90度
+    let rotate_90_ccw_text = "逆时针90度(&O)";
+    let rotate_90_ccw_utf16: Vec<u16> = rotate_90_ccw_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(rotation_menu, MF_STRING, MENU_ROTATE_90_CCW as usize, rotate_90_ccw_utf16.as_ptr());
+    
+    // 任意角度
+    let rotate_angle_text = "任意角度(&A)";
+    let rotate_angle_utf16: Vec<u16> = rotate_angle_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(rotation_menu, MF_STRING, MENU_ROTATE_ANGLE as usize, rotate_angle_utf16.as_ptr());
+    
+    // 将旋转子菜单添加到处理菜单
+    let rotate_text = "图像旋转(&G)";
+    let rotate_utf16: Vec<u16> = rotate_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(process_menu, MF_POPUP, rotation_menu as usize, rotate_utf16.as_ptr());
     
     // 添加菜单到菜单栏
     let file_text = "文件(&F)";
@@ -1233,6 +1268,106 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 }
             } else {
                 println!("没有可用的图像");
+                let msg = "没有可用的图像，请先加载图像";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        // 图像旋转命令处理
+        MENU_ROTATE_180 => {
+            if let Some(ref current) = state.current_mat.clone() {
+                match rotate_image_180(current) {
+                    Ok(rotated) => {
+                        if let Ok(()) = state.update_display_from_mat(&rotated) {
+                            println!("✅ 图像180度旋转完成");
+                            InvalidateRect(hwnd, null_mut(), 1);
+                        }
+                    }
+                    Err(e) => {
+                        println!("❌ 图像旋转失败: {}", e);
+                        let error_msg = format!("图像旋转失败：\n{}", e);
+                        let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                        let title_utf16: Vec<u16> = "旋转失败".encode_utf16().chain(std::iter::once(0)).collect();
+                        MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                    }
+                }
+            } else {
+                let msg = "没有可用的图像，请先加载图像";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        MENU_ROTATE_90_CW => {
+            if let Some(ref current) = state.current_mat.clone() {
+                match rotate_image_90_cw(current) {
+                    Ok(rotated) => {
+                        if let Ok(()) = state.update_display_from_mat(&rotated) {
+                            println!("✅ 图像顺时针90度旋转完成");
+                            InvalidateRect(hwnd, null_mut(), 1);
+                        }
+                    }
+                    Err(e) => {
+                        println!("❌ 图像旋转失败: {}", e);
+                        let error_msg = format!("图像旋转失败：\n{}", e);
+                        let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                        let title_utf16: Vec<u16> = "旋转失败".encode_utf16().chain(std::iter::once(0)).collect();
+                        MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                    }
+                }
+            } else {
+                let msg = "没有可用的图像，请先加载图像";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        MENU_ROTATE_90_CCW => {
+            if let Some(ref current) = state.current_mat.clone() {
+                match rotate_image_90_ccw(current) {
+                    Ok(rotated) => {
+                        if let Ok(()) = state.update_display_from_mat(&rotated) {
+                            println!("✅ 图像逆时针90度旋转完成");
+                            InvalidateRect(hwnd, null_mut(), 1);
+                        }
+                    }
+                    Err(e) => {
+                        println!("❌ 图像旋转失败: {}", e);
+                        let error_msg = format!("图像旋转失败：\n{}", e);
+                        let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                        let title_utf16: Vec<u16> = "旋转失败".encode_utf16().chain(std::iter::once(0)).collect();
+                        MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                    }
+                }
+            } else {
+                let msg = "没有可用的图像，请先加载图像";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        MENU_ROTATE_ANGLE => {
+            if let Some(ref current) = state.current_mat.clone() {
+                // 显示角度输入对话框
+                if let Some(angle) = show_angle_input_dialog(hwnd) {
+                    match rotate_image_angle(current, angle) {
+                        Ok(rotated) => {
+                            if let Ok(()) = state.update_display_from_mat(&rotated) {
+                                println!("✅ 图像旋转{}度完成", angle);
+                                InvalidateRect(hwnd, null_mut(), 1);
+                            }
+                        }
+                        Err(e) => {
+                            println!("❌ 图像旋转失败: {}", e);
+                            let error_msg = format!("图像旋转失败：\n{}", e);
+                            let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                            let title_utf16: Vec<u16> = "旋转失败".encode_utf16().chain(std::iter::once(0)).collect();
+                            MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                        }
+                    }
+                }
+            } else {
                 let msg = "没有可用的图像，请先加载图像";
                 let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
                 let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
@@ -2777,4 +2912,91 @@ fn resize_image(mat: &core::Mat, new_width: i32, new_height: i32, quality: i32) 
     )?;
     
     Ok(resized)
+}
+
+// 图像旋转函数
+// 180度旋转
+fn rotate_image_180(mat: &core::Mat) -> Result<core::Mat> {
+    let mut rotated = core::Mat::default();
+    
+    // 使用ROTATE_180标志进行180度旋转
+    core::rotate(mat, &mut rotated, core::ROTATE_180)?;
+    
+    Ok(rotated)
+}
+
+// 顺时针90度旋转
+fn rotate_image_90_cw(mat: &core::Mat) -> Result<core::Mat> {
+    let mut rotated = core::Mat::default();
+    
+    // 使用ROTATE_90_CLOCKWISE标志进行顺时针90度旋转
+    core::rotate(mat, &mut rotated, core::ROTATE_90_CLOCKWISE)?;
+    
+    Ok(rotated)
+}
+
+// 逆时针90度旋转
+fn rotate_image_90_ccw(mat: &core::Mat) -> Result<core::Mat> {
+    let mut rotated = core::Mat::default();
+    
+    // 使用ROTATE_90_COUNTERCLOCKWISE标志进行逆时针90度旋转
+    core::rotate(mat, &mut rotated, core::ROTATE_90_COUNTERCLOCKWISE)?;
+    
+    Ok(rotated)
+}
+
+// 任意角度旋转
+fn rotate_image_angle(mat: &core::Mat, angle: f64) -> Result<core::Mat> {
+    let center = core::Point2f::new(
+        mat.cols() as f32 / 2.0,
+        mat.rows() as f32 / 2.0,
+    );
+    
+    // 创建旋转矩阵
+    let rotation_matrix = imgproc::get_rotation_matrix_2d(center, angle, 1.0)?;
+    
+    let mut rotated = core::Mat::default();
+    let size = core::Size::new(mat.cols(), mat.rows());
+    
+    // 应用仿射变换进行旋转
+    imgproc::warp_affine(
+        mat,
+        &mut rotated,
+        &rotation_matrix,
+        size,
+        imgproc::INTER_LINEAR,
+        core::BORDER_CONSTANT,
+        core::Scalar::all(0.0),
+    )?;
+    
+    Ok(rotated)
+}
+
+// 显示角度输入对话框
+unsafe fn show_angle_input_dialog(parent_hwnd: HWND) -> Option<f64> {
+    // 使用简单的输入框获取角度
+    let title = "旋转角度";
+    
+    // 将提示文本转换为UTF-16
+    let title_utf16: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    
+    // 使用MessageBox询问用户输入（这是一个简化的实现）
+    let msg = "请在控制台输入旋转角度（正数为逆时针，负数为顺时针），然后按Enter确认。";
+    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+    
+    if MessageBoxW(parent_hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OKCANCEL | MB_ICONQUESTION) == IDOK {
+        // 在控制台获取用户输入
+        print!("请输入旋转角度: ");
+        use std::io::{self, Write};
+        io::stdout().flush().unwrap();
+        
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_ok() {
+            if let Ok(angle) = input.trim().parse::<f64>() {
+                return Some(angle);
+            }
+        }
+    }
+    
+    None
 }
