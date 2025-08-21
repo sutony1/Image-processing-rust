@@ -45,6 +45,8 @@ const MENU_ROTATE_180: u32 = 1019; // 180度旋转
 const MENU_ROTATE_90_CW: u32 = 1020; // 顺时针90度旋转
 const MENU_ROTATE_90_CCW: u32 = 1021; // 逆时针90度旋转
 const MENU_ROTATE_ANGLE: u32 = 1022; // 任意角度旋转
+// 新增：退出菜单项
+const MENU_EXIT: u32 = 1023; // 退出程序
 
 // 滑块控件常量
 const TBS_HORZ: u32 = 0x0000;
@@ -345,6 +347,14 @@ unsafe fn create_menu() -> HMENU {
     let save_file_text = "保存文件(&S)...";
     let save_file_utf16: Vec<u16> = save_file_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(file_menu, MF_STRING, MENU_SAVE_FILE as usize, save_file_utf16.as_ptr());
+    
+    // 添加分隔符
+    AppendMenuW(file_menu, MF_SEPARATOR, 0, null_mut());
+    
+    // 添加退出菜单项
+    let exit_text = "退出(&X)";
+    let exit_utf16: Vec<u16> = exit_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(file_menu, MF_STRING, MENU_EXIT as usize, exit_utf16.as_ptr());
     
     // 创建处理菜单
     let process_menu = CreatePopupMenu();
@@ -942,6 +952,10 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
                 MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
             }
+        }
+        MENU_EXIT => {
+            // 发送WM_CLOSE消息来关闭程序，等同于点击窗口右上角的X按钮
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
         }
         MENU_TO_GRAY => {
             if let Some(ref current) = state.current_mat.clone() {
