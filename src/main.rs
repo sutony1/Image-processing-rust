@@ -67,6 +67,10 @@ const TBM_GETPOS: u32 = 0x0400;   // WM_USER + 0
 // 编辑框通知常量
 const EN_CHANGE: u16 = 0x0300;
 
+// 鼠标滚轮相关常量
+const WM_MOUSEWHEEL: u32 = 0x020A;
+const WHEEL_DELTA: i16 = 120;
+
 // 滚动条常量
 const SB_LINEUP: u16 = 0;
 const SB_LINEDOWN: u16 = 1;
@@ -141,6 +145,10 @@ struct ImageState {
     selection_mode: bool, // 是否处于选框模式
     selection_start: Option<(i32,i32)>, // 选框起始点
     selection_end: Option<(i32,i32)>, // 选框结束点
+    // 新增：缩放相关状态
+    zoom_factor: f32, // 缩放比例，1.0为适应窗口大小
+    zoom_offset_x: f32, // 缩放后的图像偏移量（窗口坐标系）
+    zoom_offset_y: f32, // 缩放后的图像偏移量（窗口坐标系）
 }
 
 impl ImageState {
@@ -160,6 +168,9 @@ impl ImageState {
             selection_mode: false, // 新增：选框模式
             selection_start: None, // 新增：选框起始点
             selection_end: None, // 新增：选框结束点
+            zoom_factor: 1.0, // 新增：缩放比例
+            zoom_offset_x: 0.0, // 新增：图像偏移量
+            zoom_offset_y: 0.0, // 新增：图像偏移量
         }
     }
     
@@ -201,6 +212,9 @@ impl ImageState {
         self.current_height = image_buf.h;
         self.current_file_path = Some(path.to_string()); // 存储文件路径
         
+        // 重置缩放状态
+        self.reset_zoom();
+        
         println!("图像加载成功");
         Ok(())
     }
@@ -233,6 +247,9 @@ impl ImageState {
         self.current_width = image_buf.w;
         self.current_height = image_buf.h;
         self.current_file_path = Some(path.to_string()); // 存储文件路径
+        
+        // 重置缩放状态
+        self.reset_zoom();
         
         println!("图像加载成功（备用方法）");
         Ok(())
@@ -300,6 +317,91 @@ impl ImageState {
         } else {
             None
         }
+    }
+
+    // 缩放相关方法
+    fn reset_zoom(&mut self) {
+        self.zoom_factor = 1.0;
+        self.zoom_offset_x = 0.0;
+        self.zoom_offset_y = 0.0;
+    }
+
+    fn apply_zoom(&mut self, delta: f32, mouse_x: f32, mouse_y: f32, window_width: i32, window_height: i32) {
+        if !self.has_image() {
+            return;
+        }
+
+        let old_zoom = self.zoom_factor;
+        
+        // 计算新的缩放比例，限制范围在0.1x到10x之间
+        if delta > 0.0 {
+            self.zoom_factor *= 1.2; // 放大
+        } else {
+            self.zoom_factor /= 1.2; // 缩小
+        }
+        self.zoom_factor = self.zoom_factor.clamp(0.1, 10.0);
+
+        // 如果缩放比例没有变化，直接返回
+        if (self.zoom_factor - old_zoom).abs() < 0.001 {
+            return;
+        }
+
+        // 获取缩放前鼠标在图像中的位置
+        let (old_img_x, old_img_y, old_display_w, old_display_h) = calculate_scaled_size_with_zoom_factor(
+            self, old_zoom, window_width, window_height
+        );
+        
+        // 鼠标在缩放前图像中的相对位置（0.0-1.0）
+        let mouse_rel_x = if old_display_w > 0 {
+            (mouse_x - old_img_x as f32) / old_display_w as f32
+        } else {
+            0.5
+        };
+        let mouse_rel_y = if old_display_h > 0 {
+            (mouse_y - old_img_y as f32) / old_display_h as f32
+        } else {
+            0.5
+        };
+        
+        // 获取缩放后的图像显示尺寸
+        let (new_img_x, new_img_y, new_display_w, new_display_h) = calculate_scaled_size_with_zoom_factor(
+            self, self.zoom_factor, window_width, window_height
+        );
+        
+        // 计算鼠标在缩放后图像中应该的位置
+        let new_mouse_img_x = new_img_x as f32 + mouse_rel_x * new_display_w as f32;
+        let new_mouse_img_y = new_img_y as f32 + mouse_rel_y * new_display_h as f32;
+        
+        // 调整偏移，使鼠标指向的图像内容保持在相同的窗口位置
+        self.zoom_offset_x += mouse_x - new_mouse_img_x;
+        self.zoom_offset_y += mouse_y - new_mouse_img_y;
+    }
+
+    fn calculate_base_display_rect(&self, window_width: i32, window_height: i32) -> (i32, i32, i32, i32) {
+        if !self.has_image() {
+            return (0, 0, 0, 0);
+        }
+        
+        let img_ratio = self.current_width as f64 / self.current_height as f64;
+        let window_ratio = window_width as f64 / window_height as f64;
+        
+        let (base_width, base_height) = if img_ratio > window_ratio {
+            // 图片更宽，以窗口宽度为准
+            let base_width = window_width;
+            let base_height = (window_width as f64 / img_ratio) as i32;
+            (base_width, base_height)
+        } else {
+            // 图片更高，以窗口高度为准
+            let base_height = window_height;
+            let base_width = (window_height as f64 * img_ratio) as i32;
+            (base_width, base_height)
+        };
+        
+        // 居中显示
+        let x = (window_width - base_width) / 2;
+        let y = (window_height - base_height) / 2;
+        
+        (x, y, base_width, base_height)
     }
 }
 
@@ -627,6 +729,31 @@ fn calculate_scaled_size(img_width: i32, img_height: i32, window_width: i32, win
     (x, y, scaled_width, scaled_height)
 }
 
+// 计算支持缩放的图像显示尺寸和位置
+fn calculate_scaled_size_with_zoom(state: &ImageState, window_width: i32, window_height: i32) -> (i32, i32, i32, i32) {
+    calculate_scaled_size_with_zoom_factor(state, state.zoom_factor, window_width, window_height)
+}
+
+// 计算指定缩放比例下的图像显示尺寸和位置
+fn calculate_scaled_size_with_zoom_factor(state: &ImageState, zoom_factor: f32, window_width: i32, window_height: i32) -> (i32, i32, i32, i32) {
+    if !state.has_image() {
+        return (0, 0, 0, 0);
+    }
+    
+    // 获取基础适应窗口的尺寸
+    let (base_x, base_y, base_w, base_h) = state.calculate_base_display_rect(window_width, window_height);
+    
+    // 应用指定的缩放比例
+    let zoomed_w = (base_w as f32 * zoom_factor) as i32;
+    let zoomed_h = (base_h as f32 * zoom_factor) as i32;
+    
+    // 计算最终位置（基础位置 + 偏移）
+    let final_x = base_x + state.zoom_offset_x as i32;
+    let final_y = base_y + state.zoom_offset_y as i32;
+    
+    (final_x, final_y, zoomed_w, zoomed_h)
+}
+
 // 将窗口坐标映射到图像坐标
 unsafe fn window_to_image_coords(hwnd: HWND, img_w: i32, img_h: i32, win_x: i32, win_y: i32) -> Option<(i32,i32)> {
     let mut rect: RECT = std::mem::zeroed();
@@ -643,6 +770,35 @@ unsafe fn window_to_image_coords(hwnd: HWND, img_w: i32, img_h: i32, win_x: i32,
     let img_x = (rel_x as i64 * img_w as i64 / scaled_w as i64) as i32;
     let img_y = (rel_y as i64 * img_h as i64 / scaled_h as i64) as i32;
     Some((img_x.clamp(0, img_w-1), img_y.clamp(0, img_h-1)))
+}
+
+// 支持缩放的窗口坐标到图像坐标映射
+unsafe fn window_to_image_coords_with_zoom(hwnd: HWND, state: &ImageState, win_x: i32, win_y: i32) -> Option<(i32,i32)> {
+    if !state.has_image() {
+        return None;
+    }
+    
+    let mut rect: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rect);
+    let window_width = rect.right - rect.left;
+    let window_height = rect.bottom - rect.top;
+    
+    let (x0, y0, scaled_w, scaled_h) = calculate_scaled_size_with_zoom(state, window_width, window_height);
+    
+    // 检查点击是否在图像范围内
+    if win_x < x0 || win_y < y0 || win_x >= x0 + scaled_w || win_y >= y0 + scaled_h {
+        return None;
+    }
+    
+    let rel_x = win_x - x0;
+    let rel_y = win_y - y0;
+    if scaled_w <= 0 || scaled_h <= 0 { return None; }
+    
+    // 转换到图像坐标
+    let img_x = (rel_x as i64 * state.current_width as i64 / scaled_w as i64) as i32;
+    let img_y = (rel_y as i64 * state.current_height as i64 / scaled_h as i64) as i32;
+    
+    Some((img_x.clamp(0, state.current_width-1), img_y.clamp(0, state.current_height-1)))
 }
 
 fn overlay_mask_on_current(state: &mut ImageState, mask: &[u8], mask_w: i32, mask_h: i32) -> Result<()> {
@@ -1546,7 +1702,7 @@ unsafe extern "system" fn window_proc(
             if state.has_image() {
                 let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
                 let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
-                if let Some((ix, iy)) = window_to_image_coords(hwnd, state.current_width, state.current_height, mx, my) {
+                if let Some((ix, iy)) = window_to_image_coords_with_zoom(hwnd, state, mx, my) {
                     if state.selecting {
                         // SAM交互分割模式
                         state.select_start = Some((ix, iy));
@@ -1567,7 +1723,7 @@ unsafe extern "system" fn window_proc(
                 if state.has_image() {
                     let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
                     let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
-                    if let Some((ix, iy)) = window_to_image_coords(hwnd, state.current_width, state.current_height, mx, my) {
+                    if let Some((ix, iy)) = window_to_image_coords_with_zoom(hwnd, state, mx, my) {
                         if state.selecting {
                             // SAM交互分割模式
                             state.select_end = Some((ix, iy));
@@ -1586,7 +1742,7 @@ unsafe extern "system" fn window_proc(
             if state.has_image() {
                 let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
                 let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
-                if let Some((ix, iy)) = window_to_image_coords(hwnd, state.current_width, state.current_height, mx, my) {
+                if let Some((ix, iy)) = window_to_image_coords_with_zoom(hwnd, state, mx, my) {
                     if state.selecting {
                         // SAM交互分割模式
                         state.select_end = Some((ix, iy));
@@ -1636,6 +1792,36 @@ unsafe extern "system" fn window_proc(
             InvalidateRect(hwnd, null_mut(), 1);
             0
         }
+        WM_MOUSEWHEEL => {
+            let state = IMAGE_STATE.as_mut().unwrap();
+            if state.has_image() {
+                // 获取滚轮滚动方向和鼠标位置
+                let wheel_delta = ((wparam >> 16) & 0xFFFF) as u16 as i16;
+                let mouse_x = (lparam & 0xFFFF) as u16 as i16 as i32;
+                let mouse_y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+                
+                // 获取窗口客户区大小
+                let mut rect: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut rect);
+                let window_width = rect.right - rect.left;
+                let window_height = rect.bottom - rect.top;
+                
+                // 将屏幕坐标转换为窗口客户区坐标
+                let mut point = POINT { x: mouse_x, y: mouse_y };
+                ScreenToClient(hwnd, &mut point);
+                
+                // 应用缩放
+                let zoom_delta = if wheel_delta > 0 { 1.0 } else { -1.0 };
+                state.apply_zoom(zoom_delta, point.x as f32, point.y as f32, window_width, window_height);
+                
+                // 重绘窗口
+                InvalidateRect(hwnd, null_mut(), 1);
+                
+                println!("🔍 缩放: {:.2}x, 偏移: ({:.1}, {:.1})", 
+                    state.zoom_factor, state.zoom_offset_x, state.zoom_offset_y);
+            }
+            0
+        }
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             let hdc = BeginPaint(hwnd, &mut ps);
@@ -1659,9 +1845,8 @@ unsafe extern "system" fn window_proc(
             // 绘制图片
             if let Some(ref state) = IMAGE_STATE {
                 if state.has_image() && !state.display_pixels.is_empty() {
-                    let (x, y, scaled_width, scaled_height) = calculate_scaled_size(
-                        state.current_width,
-                        state.current_height,
+                    let (x, y, scaled_width, scaled_height) = calculate_scaled_size_with_zoom(
+                        state,
                         window_width,
                         window_height,
                     );
