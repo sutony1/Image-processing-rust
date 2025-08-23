@@ -50,7 +50,9 @@ const MENU_EXIT: u32 = 1023; // 退出程序
 // 新增：关闭当前文件菜单项
 const MENU_CLOSE_FILE: u32 = 1024; // 关闭当前文件
 // 新增：拉直菜单项
-const MENU_STRAIGHTEN: u32 = 1025; // 拉直功能
+const MENU_STRAIGHTEN: u32 = 1025; // 拉直功能（现在作为子菜单容器）
+const MENU_STRAIGHTEN_DRAW_LINE: u32 = 1026; // 画直线
+const MENU_STRAIGHTEN_HORIZONTAL: u32 = 1027; // 水平校正
 
 // 滑块控件常量
 const TBS_HORZ: u32 = 0x0000;
@@ -626,10 +628,19 @@ unsafe fn create_menu() -> HMENU {
     let sam_utf16: Vec<u16> = sam_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(menu_bar, MF_POPUP, sam_menu as usize, sam_utf16.as_ptr());
     
-    // 新增：拉直菜单
+    // 新增：拉直子菜单
+    let straighten_menu = CreatePopupMenu();
+    let draw_line_text = "画直线(&D)";
+    let draw_line_utf16: Vec<u16> = draw_line_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(straighten_menu, MF_STRING, MENU_STRAIGHTEN_DRAW_LINE as usize, draw_line_utf16.as_ptr());
+    
+    let horizontal_text = "水平校正(&H)";
+    let horizontal_utf16: Vec<u16> = horizontal_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(straighten_menu, MF_STRING, MENU_STRAIGHTEN_HORIZONTAL as usize, horizontal_utf16.as_ptr());
+    
     let straighten_text = "拉直(&T)";
     let straighten_utf16: Vec<u16> = straighten_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(menu_bar, MF_STRING, MENU_STRAIGHTEN as usize, straighten_utf16.as_ptr());
+    AppendMenuW(menu_bar, MF_POPUP, straighten_menu as usize, straighten_utf16.as_ptr());
     
     // 新增：选框工具和裁剪菜单
     let selection_menu = CreatePopupMenu();
@@ -1217,9 +1228,9 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
             }
         }
-        MENU_STRAIGHTEN => {
+        MENU_STRAIGHTEN_DRAW_LINE => {
             if state.has_image() {
-                // 激活拉直模式
+                // 激活画直线模式
                 state.straighten_mode = true;
                 state.straighten_start = None;
                 state.straighten_end = None;
@@ -1227,7 +1238,55 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 state.selection_mode = false;
                 // 更新窗口标题显示拉直提示
                 update_window_title_with_straighten_mode(hwnd, state);
-                println!("🔧 拉直模式已激活，请在图像上拖拽绘制拉直线");
+                println!("🔧 画直线模式已激活，请在图像上拖拽绘制直线");
+            } else {
+                let msg = "没有可用的图像，请先加载图像";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        MENU_STRAIGHTEN_HORIZONTAL => {
+            if state.has_image() {
+                // 检查是否已经画了直线
+                if let (Some((x1, y1)), Some((x2, y2))) = (state.straighten_start, state.straighten_end) {
+                    // 计算直线与水平线的夹角
+                    let angle = calculate_horizontal_angle(x1, y1, x2, y2);
+                    println!("🔧 计算出的角度: {:.2}度", angle);
+                    
+                    // 旋转图像
+                    if let Some(ref current) = state.current_mat.clone() {
+                        match rotate_image_angle(current, angle) {
+                            Ok(rotated) => {
+                                if let Ok(()) = state.update_display_from_mat(&rotated) {
+                                    println!("✅ 水平校正完成，图像已旋转{:.2}度", angle);
+                                    // 清除拉直线状态
+                                    state.straighten_mode = false;
+                                    state.straighten_start = None;
+                                    state.straighten_end = None;
+                                    // 更新窗口标题
+                                    let sam_loaded = state.sam_processor.as_ref().map_or(false, |sam| sam.is_encoded());
+                                    update_window_title_with_sam_status(hwnd, state, sam_loaded);
+                                    InvalidateRect(hwnd, null_mut(), 1);
+                                } else {
+                                    println!("❌ 更新显示失败");
+                                }
+                            }
+                            Err(e) => {
+                                println!("❌ 图像旋转失败: {}", e);
+                                let error_msg = format!("图像旋转失败：\n{}", e);
+                                let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                let title_utf16: Vec<u16> = "错误".encode_utf16().chain(std::iter::once(0)).collect();
+                                MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                            }
+                        }
+                    }
+                } else {
+                    let msg = "请先使用\"画直线\"功能画一条直线";
+                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                }
             } else {
                 let msg = "没有可用的图像，请先加载图像";
                 let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
@@ -3307,6 +3366,23 @@ fn rotate_image_90_ccw(mat: &core::Mat) -> Result<core::Mat> {
     core::rotate(mat, &mut rotated, core::ROTATE_90_COUNTERCLOCKWISE)?;
     
     Ok(rotated)
+}
+
+// 计算直线与水平线的夹角（以度为单位）
+fn calculate_horizontal_angle(x1: i32, y1: i32, x2: i32, y2: i32) -> f64 {
+    // 计算直线的向量
+    let dx = (x2 - x1) as f64;
+    let dy = (y2 - y1) as f64;
+    
+    // 计算与水平线（x轴正方向）的夹角
+    // 使用 atan2 计算角度，返回值范围为 [-π, π]
+    let angle_rad = dy.atan2(dx);
+    
+    // 转换为度数
+    let angle_deg = angle_rad.to_degrees();
+    
+    // 直接返回计算出的角度，用于校正图像使直线变水平
+    angle_deg
 }
 
 // 任意角度旋转
