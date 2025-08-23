@@ -47,6 +47,10 @@ const MENU_ROTATE_90_CCW: u32 = 1021; // 逆时针90度旋转
 const MENU_ROTATE_ANGLE: u32 = 1022; // 任意角度旋转
 // 新增：退出菜单项
 const MENU_EXIT: u32 = 1023; // 退出程序
+// 新增：关闭当前文件菜单项
+const MENU_CLOSE_FILE: u32 = 1024; // 关闭当前文件
+// 新增：拉直菜单项
+const MENU_STRAIGHTEN: u32 = 1025; // 拉直功能
 
 // 滑块控件常量
 const TBS_HORZ: u32 = 0x0000;
@@ -149,6 +153,10 @@ struct ImageState {
     zoom_factor: f32, // 缩放比例，1.0为适应窗口大小
     zoom_offset_x: f32, // 缩放后的图像偏移量（窗口坐标系）
     zoom_offset_y: f32, // 缩放后的图像偏移量（窗口坐标系）
+    // 新增：拉直工具相关状态
+    straighten_mode: bool, // 是否处于拉直模式
+    straighten_start: Option<(i32,i32)>, // 拉直线起始点
+    straighten_end: Option<(i32,i32)>, // 拉直线结束点
 }
 
 impl ImageState {
@@ -171,6 +179,9 @@ impl ImageState {
             zoom_factor: 1.0, // 新增：缩放比例
             zoom_offset_x: 0.0, // 新增：图像偏移量
             zoom_offset_y: 0.0, // 新增：图像偏移量
+            straighten_mode: false, // 新增：拉直模式
+            straighten_start: None, // 新增：拉直线起始点
+            straighten_end: None, // 新增：拉直线结束点
         }
     }
     
@@ -326,6 +337,29 @@ impl ImageState {
         self.zoom_offset_y = 0.0;
     }
 
+    // 关闭当前文件，重置到初始状态
+    fn close_current_file(&mut self) {
+        self.original_bgr = None;
+        self.current_mat = None;
+        self.display_pixels.clear();
+        self.current_width = 0;
+        self.current_height = 0;
+        self.current_file_path = None;
+        self.sam_processor = None;
+        self.selecting = false;
+        self.select_start = None;
+        self.select_end = None;
+        self.current_mask = None;
+        self.selection_mode = false;
+        self.selection_start = None;
+        self.selection_end = None;
+        self.straighten_mode = false;
+        self.straighten_start = None;
+        self.straighten_end = None;
+        self.reset_zoom();
+        println!("✅ 当前文件已关闭，状态已重置");
+    }
+
     fn apply_zoom(&mut self, delta: f32, mouse_x: f32, mouse_y: f32, window_width: i32, window_height: i32) {
         if !self.has_image() {
             return;
@@ -449,6 +483,11 @@ unsafe fn create_menu() -> HMENU {
     let save_file_text = "保存文件(&S)...";
     let save_file_utf16: Vec<u16> = save_file_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(file_menu, MF_STRING, MENU_SAVE_FILE as usize, save_file_utf16.as_ptr());
+    
+    // 添加关闭当前文件菜单项
+    let close_file_text = "关闭当前文件(&C)";
+    let close_file_utf16: Vec<u16> = close_file_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(file_menu, MF_STRING, MENU_CLOSE_FILE as usize, close_file_utf16.as_ptr());
     
     // 添加分隔符
     AppendMenuW(file_menu, MF_SEPARATOR, 0, null_mut());
@@ -586,6 +625,11 @@ unsafe fn create_menu() -> HMENU {
     let sam_text = "SAM分割(&S)";
     let sam_utf16: Vec<u16> = sam_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(menu_bar, MF_POPUP, sam_menu as usize, sam_utf16.as_ptr());
+    
+    // 新增：拉直菜单
+    let straighten_text = "拉直(&T)";
+    let straighten_utf16: Vec<u16> = straighten_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(menu_bar, MF_STRING, MENU_STRAIGHTEN as usize, straighten_utf16.as_ptr());
     
     // 新增：选框工具和裁剪菜单
     let selection_menu = CreatePopupMenu();
@@ -752,6 +796,54 @@ fn calculate_scaled_size_with_zoom_factor(state: &ImageState, zoom_factor: f32, 
     let final_y = base_y + state.zoom_offset_y as i32;
     
     (final_x, final_y, zoomed_w, zoomed_h)
+}
+
+// 更新窗口标题，显示SAM模型状态
+unsafe fn update_window_title_with_sam_status(hwnd: HWND, state: &ImageState, sam_loaded: bool) {
+    let base_title = if state.has_image() {
+        format!("图像查看器 - {}x{} - OpenCV处理", 
+            state.current_width, 
+            state.current_height
+        )
+    } else {
+        "图像处理查看器 - OpenCV + Win32".to_string()
+    };
+    
+    let full_title = if sam_loaded {
+        format!("{} - SAM模型已加载", base_title)
+    } else {
+        base_title
+    };
+    
+    let title_utf16: Vec<u16> = full_title.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(hwnd, title_utf16.as_ptr());
+}
+
+// 更新窗口标题，显示拉直模式状态
+unsafe fn update_window_title_with_straighten_mode(hwnd: HWND, state: &ImageState) {
+    let base_title = if state.has_image() {
+        format!("图像查看器 - {}x{} - OpenCV处理", 
+            state.current_width, 
+            state.current_height
+        )
+    } else {
+        "图像处理查看器 - OpenCV + Win32".to_string()
+    };
+    
+    let sam_suffix = if state.sam_processor.as_ref().map_or(false, |sam| sam.is_encoded()) {
+        " - SAM模型已加载"
+    } else {
+        ""
+    };
+    
+    let full_title = if state.straighten_mode {
+        format!("{}{} - 请画一条拉直线", base_title, sam_suffix)
+    } else {
+        format!("{}{}", base_title, sam_suffix)
+    };
+    
+    let title_utf16: Vec<u16> = full_title.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(hwnd, title_utf16.as_ptr());
 }
 
 // 将窗口坐标映射到图像坐标
@@ -1074,6 +1166,8 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 match state.load_image(&file_path) {
                     Ok(()) => {
                         println!("✅ 成功加载图像: {}", file_path);
+                        // 更新窗口标题（新图像加载时SAM状态为未加载）
+                        update_window_title_with_sam_status(hwnd, state, false);
                         InvalidateRect(hwnd, null_mut(), 1);
                     }
                     Err(e) => {
@@ -1104,6 +1198,38 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 }
             } else {
                 let msg = "没有可保存的图像，请先进行处理或打开图像";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        MENU_CLOSE_FILE => {
+            if state.has_image() {
+                state.close_current_file();
+                // 更新窗口标题为初始状态
+                update_window_title_with_sam_status(hwnd, state, false);
+                // 重绘窗口以显示黑屏状态
+                InvalidateRect(hwnd, null_mut(), 1);
+            } else {
+                let msg = "当前没有打开的文件";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        MENU_STRAIGHTEN => {
+            if state.has_image() {
+                // 激活拉直模式
+                state.straighten_mode = true;
+                state.straighten_start = None;
+                state.straighten_end = None;
+                // 关闭其他模式
+                state.selection_mode = false;
+                // 更新窗口标题显示拉直提示
+                update_window_title_with_straighten_mode(hwnd, state);
+                println!("🔧 拉直模式已激活，请在图像上拖拽绘制拉直线");
+            } else {
+                let msg = "没有可用的图像，请先加载图像";
                 let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
                 let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
                 MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
@@ -1552,10 +1678,11 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                             match sam.encode_image(current) {
                                 Ok(()) => {
                                     println!("✅ SAM图像编码完成");
-                                    let msg = "SAM图像编码完成！\n\n现在可以使用\"SAM交互分割\"功能进行对象分割。";
-                                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                                    let title_utf16: Vec<u16> = "编码成功".encode_utf16().chain(std::iter::once(0)).collect();
-                                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                                    
+                                    // 更新窗口标题显示SAM模型已加载
+                                    update_window_title_with_sam_status(hwnd, state, true);
+                                    
+                                    // 不再显示对话框，用户可以从窗口标题看到SAM模型已加载
                                 }
                                 Err(e) => {
                                     println!("❌ SAM编码失败: {}", e);
@@ -1711,6 +1838,10 @@ unsafe extern "system" fn window_proc(
                         // 选框工具模式
                         state.selection_start = Some((ix, iy));
                         state.selection_end = Some((ix, iy));
+                    } else if state.straighten_mode {
+                        // 拉直工具模式
+                        state.straighten_start = Some((ix, iy));
+                        state.straighten_end = Some((ix, iy));
                     }
                     InvalidateRect(hwnd, null_mut(), 1);
                 }
@@ -1730,6 +1861,9 @@ unsafe extern "system" fn window_proc(
                         } else if state.selection_mode {
                             // 选框工具模式
                             state.selection_end = Some((ix, iy));
+                        } else if state.straighten_mode {
+                            // 拉直工具模式
+                            state.straighten_end = Some((ix, iy));
                         }
                         InvalidateRect(hwnd, null_mut(), 0);
                     }
@@ -1781,6 +1915,13 @@ unsafe extern "system" fn window_proc(
                         println!("✅ 选框完成: ({},{}) -> ({},{})", 
                             state.selection_start.unwrap().0, state.selection_start.unwrap().1,
                             ix, iy);
+                    } else if state.straighten_mode {
+                        // 拉直工具模式
+                        state.straighten_end = Some((ix, iy));
+                        // 拉直模式下不自动退出，保持拉直线显示
+                        if let (Some((x1,y1)), Some((x2,y2))) = (state.straighten_start, state.straighten_end) {
+                            println!("✅ 拉直线完成: ({},{}) -> ({},{})", x1, y1, x2, y2);
+                        }
                     }
                 }
                 InvalidateRect(hwnd, null_mut(), 1);
@@ -1959,13 +2100,37 @@ unsafe extern "system" fn window_proc(
                         }
                     }
                     
-                    // 更新窗口标题显示图像信息
-                    let info_text = format!("图像查看器 - {}x{} - OpenCV处理", 
-                        state.current_width, 
-                        state.current_height
-                    );
-                    let title_utf16: Vec<u16> = info_text.encode_utf16().chain(std::iter::once(0)).collect();
-                    SetWindowTextW(hwnd, title_utf16.as_ptr());
+                    // 新增：拉直工具直线绘制
+                    if state.straighten_mode {
+                        if let (Some((sx, sy)), Some((ex, ey))) = (state.straighten_start, state.straighten_end) {
+                            // 将图像坐标转换回窗口坐标用于绘制
+                            let to_win = |ix: i32, iy: i32| -> (i32,i32) {
+                                let wx = x + (ix * scaled_width) / state.current_width;
+                                let wy = y + (iy * scaled_height) / state.current_height;
+                                (wx, wy)
+                            };
+                            let (wx1, wy1) = to_win(sx, sy);
+                            let (wx2, wy2) = to_win(ex, ey);
+                            
+                            // 绘制绿色直线（3像素宽）
+                            let pen = CreatePen(PS_SOLID as i32, 3, RGB(0,255,0));
+                            let old_pen = SelectObject(mem_dc, pen as HGDIOBJ);
+                            
+                            MoveToEx(mem_dc, wx1, wy1, null_mut());
+                            LineTo(mem_dc, wx2, wy2);
+                            
+                            SelectObject(mem_dc, old_pen);
+                            DeleteObject(pen as HGDIOBJ);
+                        }
+                    }
+                    
+                    // 更新窗口标题显示图像信息和SAM状态
+                    let sam_loaded = state.sam_processor.as_ref().map_or(false, |sam| sam.is_encoded());
+                    if state.straighten_mode {
+                        update_window_title_with_straighten_mode(hwnd, state);
+                    } else {
+                        update_window_title_with_sam_status(hwnd, state, sam_loaded);
+                    }
                 } else {
                     // 显示提示信息
                     let hint_text = "请使用菜单 文件->打开文件 来加载图像";
