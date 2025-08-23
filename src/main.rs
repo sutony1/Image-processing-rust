@@ -335,9 +335,9 @@ impl ImageState {
         
         // 计算新的缩放比例，限制范围在0.1x到10x之间
         if delta > 0.0 {
-            self.zoom_factor *= 1.2; // 放大
+            self.zoom_factor *= 1.1; // 放大（更平缓）
         } else {
-            self.zoom_factor /= 1.2; // 缩小
+            self.zoom_factor /= 1.1; // 缩小（更平缓）
         }
         self.zoom_factor = self.zoom_factor.clamp(0.1, 10.0);
 
