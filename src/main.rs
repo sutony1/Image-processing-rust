@@ -4,7 +4,8 @@ use winapi::um::winuser::{*, EnableWindow, SetForegroundWindow, LoadCursorW, IDC
 use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::wingdi::*;
 use winapi::um::commdlg::*;
-
+// 添加拖拽支持所需的导入
+use winapi::um::shellapi::{DragAcceptFiles, DragQueryFileW, DragFinish};
 
 use winapi::shared::windef::*;
 use winapi::shared::minwindef::*;
@@ -99,6 +100,12 @@ const INTER_LINEAR: i32 = 1;       // 双线性插值（默认）
 const INTER_CUBIC: i32 = 2;        // 双三次插值
 const INTER_AREA: i32 = 3;         // 区域插值
 const INTER_LANCZOS4: i32 = 4;     // Lanczos插值
+
+// 拖拽文件相关常量
+const WM_DROPFILES: u32 = 0x0233;
+
+// HDROP类型定义 - 使用正确的winapi类型
+use winapi::um::shellapi::HDROP;
 
 // 调整图像大小对话框结果
 #[derive(Debug, Clone)]
@@ -1879,6 +1886,11 @@ unsafe extern "system" fn window_proc(
             handle_menu_command(hwnd, command_id);
             0
         }
+        // 添加拖拽文件处理
+        WM_DROPFILES => {
+            handle_drop_files(hwnd, wparam as HDROP);
+            0
+        }
 		WM_ERASEBKGND => {
 			// 我们自己进行背景清除与双缓冲绘制，阻止系统擦除背景以减少闪烁
 			1
@@ -2309,12 +2321,16 @@ fn main() {
             panic!("Failed to create window");
         }
 
+        // 启用拖拽文件接受
+        DragAcceptFiles(hwnd, 1); // 1表示接受拖拽文件
+
         // 显示和更新窗口
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
 
         println!("✅ 程序启动成功！");
         println!("📁 使用菜单 文件->打开文件 来加载图像");
+        println!("🖱️ 或者直接拖拽图像文件到窗口来加载图像");
         println!("🎨 支持的功能:");
         println!("   - 灰度转换");
         println!("   - 高斯模糊");
@@ -3439,4 +3455,92 @@ unsafe fn show_angle_input_dialog(parent_hwnd: HWND) -> Option<f64> {
     }
     
     None
+}
+
+// 添加拖拽文件处理函数
+unsafe fn handle_drop_files(hwnd: HWND, hdrop: HDROP) {
+    // 获取拖拽的文件数量
+    let file_count = DragQueryFileW(hdrop, 0xFFFFFFFF, null_mut(), 0);
+    
+    if file_count > 0 {
+        // 只处理第一个文件
+        let buffer_size = DragQueryFileW(hdrop, 0, null_mut(), 0) + 1;
+        let mut buffer: Vec<u16> = vec![0; buffer_size as usize];
+        
+        if DragQueryFileW(hdrop, 0, buffer.as_mut_ptr(), buffer_size) > 0 {
+            // 将UTF-16转换为Rust字符串
+            let file_path = String::from_utf16_lossy(&buffer[..buffer_size as usize - 1]);
+            println!("📁 拖拽文件: {}", file_path);
+            
+            // 检查文件扩展名是否为支持的图像格式
+            let supported_extensions = ["jpg", "jpeg", "png", "bmp", "tiff", "tif", "webp"];
+            let ext = std::path::Path::new(&file_path)
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_lowercase());
+            
+            if let Some(extension) = ext {
+                if supported_extensions.contains(&extension.as_str()) {
+                    // 加载图像
+                    match load_image_from_path(&file_path) {
+                        Ok(_) => {
+                            println!("✅ 成功加载拖拽的图像: {}", file_path);
+                            InvalidateRect(hwnd, null_mut(), 1);
+                        }
+                        Err(e) => {
+                            println!("❌ 加载拖拽图像失败: {}", e);
+                            let msg = format!("无法加载拖拽的图像：\n{}\n\n错误：{}", file_path, e);
+                            let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                            let title_utf16: Vec<u16> = "加载图像失败".encode_utf16().chain(std::iter::once(0)).collect();
+                            MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                        }
+                    }
+                } else {
+                    let msg = format!("不支持的文件格式：{}\n\n支持的格式：JPG, PNG, BMP, TIFF, WebP", extension.to_uppercase());
+                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "不支持的文件格式".encode_utf16().chain(std::iter::once(0)).collect();
+                            MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONWARNING);
+                }
+            }
+        }
+    }
+    
+    // 释放拖拽资源
+    DragFinish(hdrop);
+}
+
+// 从文件路径加载图像的函数
+fn load_image_from_path(file_path: &str) -> Result<()> {
+    let state = unsafe { IMAGE_STATE.as_mut().unwrap() };
+    
+    // 使用OpenCV加载图像
+    let mat = imgcodecs::imread(file_path, imgcodecs::IMREAD_COLOR)
+        .context("无法读取图像文件")?;
+    
+    if mat.empty() {
+        return Err(anyhow::anyhow!("图像文件为空或格式不受支持"));
+    }
+    
+    // 转换为显示格式
+    match ocv_bridge::mat_to_bgra(&mat) {
+        Ok(image_buf) => {
+            state.display_pixels = image_buf.pixels;
+            state.current_width = image_buf.w;
+            state.current_height = image_buf.h;
+            state.current_file_path = Some(file_path.to_string());
+            
+            // 更新Mat数据
+            state.original_bgr = Some(mat.clone());
+            state.current_mat = Some(mat);
+            
+            // 重置缩放状态
+            state.reset_zoom();
+            
+            println!("✅ 图像加载成功：{}x{}", image_buf.w, image_buf.h);
+            Ok(())
+        }
+        Err(e) => {
+            Err(anyhow::anyhow!("转换图像格式失败: {}", e))
+        }
+    }
 }
