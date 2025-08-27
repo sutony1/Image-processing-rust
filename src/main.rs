@@ -55,6 +55,10 @@ const MENU_STRAIGHTEN: u32 = 1025; // 拉直功能（现在作为子菜单容器
 const MENU_STRAIGHTEN_DRAW_LINE: u32 = 1026; // 画直线
 const MENU_STRAIGHTEN_HORIZONTAL: u32 = 1027; // 水平校正
 
+// 新增：批量处理菜单项
+const MENU_BATCH_PROCESS: u32 = 1028; // 批量处理菜单
+const MENU_BATCH_RESIZE: u32 = 1029; // 批量缩图
+
 // 滑块控件常量
 const TBS_HORZ: u32 = 0x0000;
 const TBS_AUTOTICKS: u32 = 0x0001;
@@ -93,6 +97,17 @@ const IDC_CANCEL_BUTTON: i32 = 1006;
 const IDC_QUALITY_TRACKBAR: i32 = 1007; // 质量滑块ID
 const IDC_WIDTH_EDIT: i32 = 1008;  // 宽度输入框ID
 const IDC_HEIGHT_EDIT: i32 = 1009; // 高度输入框ID
+
+// 新增：批量缩图对话框控件ID
+const IDC_INPUT_FOLDER_EDIT: i32 = 2001; // 输入文件夹路径输入框
+const IDC_INPUT_FOLDER_BUTTON: i32 = 2002; // 输入文件夹选择按钮
+const IDC_OUTPUT_FOLDER_EDIT: i32 = 2003; // 输出文件夹路径输入框
+const IDC_OUTPUT_FOLDER_BUTTON: i32 = 2004; // 输出文件夹选择按钮
+const IDC_LONG_EDGE_EDIT: i32 = 2005; // 长边限制输入框
+const IDC_START_CONVERT_BUTTON: i32 = 2006; // 开始转换按钮
+const IDC_BATCH_QUALITY_TRACKBAR: i32 = 2007; // 批量处理质量滑块
+const IDC_BATCH_QUALITY_LABEL: i32 = 2008; // 批量处理质量标签
+const IDC_BATCH_INTERPOLATION_COMBO: i32 = 2009; // 批量处理插值算法下拉框
 
 // 插值算法常量
 const INTER_NEAREST: i32 = 0;      // 最近邻插值
@@ -659,11 +674,21 @@ unsafe fn create_menu() -> HMENU {
     let crop_selection_utf16: Vec<u16> = crop_selection_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(selection_menu, MF_STRING, MENU_CROP_SELECTION as usize, crop_selection_utf16.as_ptr());
     
-    let selection_text = "选框工具(&S)";
-    let selection_utf16: Vec<u16> = selection_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(menu_bar, MF_POPUP, selection_menu as usize, selection_utf16.as_ptr());
-    
-    menu_bar
+            let selection_text = "选框工具(&S)";
+        let selection_utf16: Vec<u16> = selection_text.encode_utf16().chain(std::iter::once(0)).collect();
+        AppendMenuW(menu_bar, MF_POPUP, selection_menu as usize, selection_utf16.as_ptr());
+        
+        // 新增：批量处理菜单
+        let batch_menu = CreatePopupMenu();
+        let batch_resize_text = "批量缩图(&R)";
+        let batch_resize_utf16: Vec<u16> = batch_resize_text.encode_utf16().chain(std::iter::once(0)).collect();
+        AppendMenuW(batch_menu, MF_STRING, MENU_BATCH_RESIZE as usize, batch_resize_utf16.as_ptr());
+        
+        let batch_text = "批量处理(&B)";
+        let batch_text_utf16: Vec<u16> = batch_text.encode_utf16().chain(std::iter::once(0)).collect();
+        AppendMenuW(menu_bar, MF_POPUP, batch_menu as usize, batch_text_utf16.as_ptr());
+        
+        menu_bar
 }
 
 // 显示文件打开对话框
@@ -1849,11 +1874,6 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 Ok(()) => {
                     println!("✅ 选框区域裁剪完成");
                     InvalidateRect(hwnd, null_mut(), 1);
-                    
-                    let msg = "选框区域裁剪完成！\n\n当前显示的是从原图中裁剪出的选框区域。\n您可以使用\"保存文件\"功能保存这个裁剪结果。";
-                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                    let title_utf16: Vec<u16> = "裁剪成功".encode_utf16().chain(std::iter::once(0)).collect();
-                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
                 }
                 Err(e) => {
                     println!("❌ 选框区域裁剪失败: {}", e);
@@ -1863,6 +1883,11 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                     MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
                 }
             }
+        }
+        
+        // 新增：批量缩图菜单处理
+        MENU_BATCH_RESIZE => {
+            show_batch_resize_dialog(hwnd);
         }
         
         _ => {}
@@ -3543,4 +3568,772 @@ fn load_image_from_path(file_path: &str) -> Result<()> {
             Err(anyhow::anyhow!("转换图像格式失败: {}", e))
         }
     }
+}
+
+// 新增：批量缩图对话框结构体
+#[derive(Debug, Clone)]
+struct BatchResizeSettings {
+    input_folder: String,
+    output_folder: String,
+    long_edge_limit: i32,
+    quality: i32,
+    interpolation: i32,
+}
+
+// 新增：显示批量缩图对话框
+unsafe fn show_batch_resize_dialog(hwnd: HWND) {
+    println!("开始创建批量缩图对话框");
+    
+    // 注册对话框窗口类
+    let dialog_class = "BatchResizeDialogClass";
+    let dialog_class_utf16: Vec<u16> = dialog_class.encode_utf16().chain(std::iter::once(0)).collect();
+    
+    let wc = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(batch_resize_dialog_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: GetModuleHandleW(null_mut()),
+        hIcon: null_mut(),
+        hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+        hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
+        lpszMenuName: null_mut(),
+        lpszClassName: dialog_class_utf16.as_ptr(),
+    };
+    
+    if RegisterClassW(&wc) == 0 {
+        println!("错误：无法注册批量缩图对话框窗口类");
+        return;
+    }
+    
+    // 创建模态对话框窗口
+    let dialog_hwnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        dialog_class_utf16.as_ptr(),
+        null_mut(),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | DS_MODALFRAME,
+        100, 100, 500, 600,
+        hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    if dialog_hwnd.is_null() {
+        println!("错误：无法创建批量缩图对话框窗口");
+        return;
+    }
+    
+    println!("批量缩图对话框窗口创建成功，句柄: {:?}", dialog_hwnd);
+    
+    // 设置对话框标题
+    let title = "Resize";
+    let title_utf16: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(dialog_hwnd, title_utf16.as_ptr());
+    
+    // 创建控件
+    let static_class = "STATIC";
+    let static_class_utf16: Vec<u16> = static_class.encode_utf16().chain(std::iter::once(0)).collect();
+    let edit_class = "EDIT";
+    let edit_class_utf16: Vec<u16> = edit_class.encode_utf16().chain(std::iter::once(0)).collect();
+    let button_class = "BUTTON";
+    let button_class_utf16: Vec<u16> = button_class.encode_utf16().chain(std::iter::once(0)).collect();
+    
+    // 创建 Input folder 标签
+    let input_label = CreateWindowExW(
+        0,
+        static_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        20, 30, 80, 20,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    let input_label_text = "Input folder:";
+    let input_label_text_utf16: Vec<u16> = input_label_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(input_label, input_label_text_utf16.as_ptr());
+    
+    // 创建 Input folder 输入框
+    let input_edit = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        edit_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+        110, 30, 250, 20,
+        dialog_hwnd,
+        IDC_INPUT_FOLDER_EDIT as HMENU,
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    // 创建 Input folder Open 按钮
+    let input_button = CreateWindowExW(
+        0,
+        button_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+        370, 30, 60, 20,
+        dialog_hwnd,
+        IDC_INPUT_FOLDER_BUTTON as HMENU,
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    let input_button_text = "Open";
+    let input_button_text_utf16: Vec<u16> = input_button_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(input_button, input_button_text_utf16.as_ptr());
+    
+    // 创建 Output folder 标签
+    let output_label = CreateWindowExW(
+        0,
+        static_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        20, 70, 80, 20,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    let output_label_text = "Output folder:";
+    let output_label_text_utf16: Vec<u16> = output_label_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(output_label, output_label_text_utf16.as_ptr());
+    
+    // 创建 Output folder 输入框
+    let output_edit = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        edit_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+        110, 70, 250, 20,
+        dialog_hwnd,
+        IDC_OUTPUT_FOLDER_EDIT as HMENU,
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    // 创建 Output folder Open 按钮
+    let output_button = CreateWindowExW(
+        0,
+        button_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+        370, 70, 60, 20,
+        dialog_hwnd,
+        IDC_OUTPUT_FOLDER_BUTTON as HMENU,
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    let output_button_text = "Open";
+    let output_button_text_utf16: Vec<u16> = output_button_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(output_button, output_button_text_utf16.as_ptr());
+    
+    // 创建 长边限制 标签
+    let long_edge_label = CreateWindowExW(
+        0,
+        static_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        20, 110, 80, 20,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    let long_edge_label_text = "长边限制:";
+    let long_edge_label_text_utf16: Vec<u16> = long_edge_label_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(long_edge_label, long_edge_label_text_utf16.as_ptr());
+    
+    // 创建 长边限制 输入框
+    let long_edge_edit = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        edit_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+        110, 110, 100, 20,
+        dialog_hwnd,
+        IDC_LONG_EDGE_EDIT as HMENU,
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    // 设置默认值 1024
+    let long_edge_default = "1024";
+    let long_edge_default_utf16: Vec<u16> = long_edge_default.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(long_edge_edit, long_edge_default_utf16.as_ptr());
+    
+    // 创建质量标签
+    let quality_label = CreateWindowExW(
+        0,
+        static_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        20, 150, 100, 20,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    let quality_label_text = "质量: 80% (高)";
+    let quality_label_text_utf16: Vec<u16> = quality_label_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(quality_label, quality_label_text_utf16.as_ptr());
+    
+    // 创建质量滑块
+    let msctls_trackbar32_class = "msctls_trackbar32";
+    let msctls_trackbar32_class_utf16: Vec<u16> = msctls_trackbar32_class.encode_utf16().chain(std::iter::once(0)).collect();
+    let quality_trackbar = CreateWindowExW(
+        0,
+        msctls_trackbar32_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
+        20, 180, 200, 30,
+        dialog_hwnd,
+        IDC_BATCH_QUALITY_TRACKBAR as HMENU,
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    // 设置滑块范围 (1-100)
+    SendMessageW(quality_trackbar, TBM_SETRANGE, 1, MAKELONG!(1, 100) as isize);
+    SendMessageW(quality_trackbar, TBM_SETPOS, 1, 80);
+    
+    // 创建插值算法标签
+    let interpolation_label = CreateWindowExW(
+        0,
+        static_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        20, 220, 100, 20,
+        dialog_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    let interpolation_label_text = "插值算法:";
+    let interpolation_label_text_utf16: Vec<u16> = interpolation_label_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(interpolation_label, interpolation_label_text_utf16.as_ptr());
+    
+    // 创建插值算法选择下拉框
+    let combobox_class = "COMBOBOX";
+    let combobox_class_utf16: Vec<u16> = combobox_class.encode_utf16().chain(std::iter::once(0)).collect();
+    let interpolation_combo = CreateWindowExW(
+        0,
+        combobox_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+        110, 220, 150, 100,
+        dialog_hwnd,
+        IDC_BATCH_INTERPOLATION_COMBO as HMENU,
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    // 添加插值算法选项
+    let nearest_text = "最近邻插值 (最快)";
+    let nearest_text_utf16: Vec<u16> = nearest_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SendMessageW(interpolation_combo, CB_ADDSTRING, 0, nearest_text_utf16.as_ptr() as LPARAM);
+    
+    let linear_text = "双线性插值 (推荐)";
+    let linear_text_utf16: Vec<u16> = linear_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SendMessageW(interpolation_combo, CB_ADDSTRING, 0, linear_text_utf16.as_ptr() as LPARAM);
+    
+    let cubic_text = "双三次插值 (高质量)";
+    let cubic_text_utf16: Vec<u16> = cubic_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SendMessageW(interpolation_combo, CB_ADDSTRING, 0, cubic_text_utf16.as_ptr() as LPARAM);
+    
+    let area_text = "区域插值 (适合缩小)";
+    let area_text_utf16: Vec<u16> = area_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SendMessageW(interpolation_combo, CB_ADDSTRING, 0, area_text_utf16.as_ptr() as LPARAM);
+    
+    let lanczos_text = "Lanczos插值 (最高质量)";
+    let lanczos_text_utf16: Vec<u16> = lanczos_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SendMessageW(interpolation_combo, CB_ADDSTRING, 0, lanczos_text_utf16.as_ptr() as LPARAM);
+    
+    // 设置默认选择为双线性插值（索引1）
+    SendMessageW(interpolation_combo, CB_SETCURSEL, 1, 0);
+    
+    // 创建开始转换按钮
+    let start_button = CreateWindowExW(
+        0,
+        button_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+        20, 270, 100, 30,
+        dialog_hwnd,
+        IDC_START_CONVERT_BUTTON as HMENU,
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    let start_button_text = "开始转换";
+    let start_button_text_utf16: Vec<u16> = start_button_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(start_button, start_button_text_utf16.as_ptr());
+    
+    // 创建取消按钮
+    let cancel_button = CreateWindowExW(
+        0,
+        button_class_utf16.as_ptr(),
+        null_mut(),
+        WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+        140, 270, 80, 30,
+        dialog_hwnd,
+        IDC_CANCEL_BUTTON as HMENU,
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    let cancel_button_text = "取消";
+    let cancel_button_text_utf16: Vec<u16> = cancel_button_text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(cancel_button, cancel_button_text_utf16.as_ptr());
+    
+    // 设置对话框为模态
+    EnableWindow(hwnd, 0);
+    SetForegroundWindow(dialog_hwnd);
+    
+    // 消息循环处理对话框
+    let mut msg: MSG = std::mem::zeroed();
+    
+    while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+        
+        // 检查是否应该退出对话框
+        if msg.message == WM_CLOSE {
+            break;
+        }
+    }
+    
+    // 恢复主窗口
+    EnableWindow(hwnd, 1);
+    SetForegroundWindow(hwnd);
+    ShowWindow(hwnd, SW_RESTORE);
+    
+    // 销毁对话框
+    DestroyWindow(dialog_hwnd);
+    
+    // 注销窗口类
+    UnregisterClassW(dialog_class_utf16.as_ptr(), GetModuleHandleW(null_mut()));
+}
+
+// 新增：批量缩图对话框窗口过程函数
+unsafe extern "system" fn batch_resize_dialog_proc(
+    hwnd: HWND,
+    msg: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            let control_id = (wparam & 0xFFFF) as i32;
+            println!("[batch_resize_dialog_proc] 收到 WM_COMMAND，控件ID: {}", control_id);
+            
+            match control_id {
+                IDC_INPUT_FOLDER_BUTTON => {
+                    println!("[batch_resize_dialog_proc] Input folder Open 按钮被点击");
+                    if let Some(folder_path) = show_folder_dialog(hwnd) {
+                        // 更新输入文件夹输入框
+                        let input_edit = GetDlgItem(hwnd, IDC_INPUT_FOLDER_EDIT);
+                        if !input_edit.is_null() {
+                            let folder_path_utf16: Vec<u16> = folder_path.encode_utf16().chain(std::iter::once(0)).collect();
+                            SetWindowTextW(input_edit, folder_path_utf16.as_ptr());
+                            
+                            // 自动设置输出文件夹为 [input_folder]/resized
+                            let output_path = format!("{}/resized", folder_path);
+                            let output_edit = GetDlgItem(hwnd, IDC_OUTPUT_FOLDER_EDIT);
+                            if !output_edit.is_null() {
+                                let output_path_utf16: Vec<u16> = output_path.encode_utf16().chain(std::iter::once(0)).collect();
+                                SetWindowTextW(output_edit, output_path_utf16.as_ptr());
+                            }
+                        }
+                    }
+                }
+                IDC_OUTPUT_FOLDER_BUTTON => {
+                    println!("[batch_resize_dialog_proc] Output folder Open 按钮被点击");
+                    if let Some(folder_path) = show_folder_dialog(hwnd) {
+                        // 更新输出文件夹输入框
+                        let output_edit = GetDlgItem(hwnd, IDC_OUTPUT_FOLDER_EDIT);
+                        if !output_edit.is_null() {
+                            let folder_path_utf16: Vec<u16> = folder_path.encode_utf16().chain(std::iter::once(0)).collect();
+                            SetWindowTextW(output_edit, folder_path_utf16.as_ptr());
+                        }
+                    }
+                }
+                IDC_START_CONVERT_BUTTON => {
+                    println!("[batch_resize_dialog_proc] 开始转换按钮被点击");
+                    
+                    // 获取所有设置
+                    let mut settings = BatchResizeSettings {
+                        input_folder: String::new(),
+                        output_folder: String::new(),
+                        long_edge_limit: 1024,
+                        quality: 80,
+                        interpolation: INTER_LINEAR,
+                    };
+                    
+                    // 获取输入文件夹
+                    let input_edit = GetDlgItem(hwnd, IDC_INPUT_FOLDER_EDIT);
+                    if !input_edit.is_null() {
+                        let text_len = SendMessageW(input_edit, WM_GETTEXTLENGTH, 0, 0);
+                        if text_len > 0 {
+                            let mut buffer = vec![0u16; text_len as usize + 1];
+                            SendMessageW(input_edit, WM_GETTEXT, buffer.len(), buffer.as_mut_ptr() as LPARAM);
+                            if let Ok(input_path) = String::from_utf16(&buffer[..text_len as usize]) {
+                                settings.input_folder = input_path;
+                            }
+                        }
+                    }
+                    
+                    // 获取输出文件夹
+                    let output_edit = GetDlgItem(hwnd, IDC_OUTPUT_FOLDER_EDIT);
+                    if !output_edit.is_null() {
+                        let text_len = SendMessageW(output_edit, WM_GETTEXTLENGTH, 0, 0);
+                        if text_len > 0 {
+                            let mut buffer = vec![0u16; text_len as usize + 1];
+                            SendMessageW(output_edit, WM_GETTEXT, buffer.len(), buffer.as_mut_ptr() as LPARAM);
+                            if let Ok(output_path) = String::from_utf16(&buffer[..text_len as usize]) {
+                                settings.output_folder = output_path;
+                            }
+                        }
+                    }
+                    
+                    // 获取长边限制
+                    let long_edge_edit = GetDlgItem(hwnd, IDC_LONG_EDGE_EDIT);
+                    if !long_edge_edit.is_null() {
+                        let text_len = SendMessageW(long_edge_edit, WM_GETTEXTLENGTH, 0, 0);
+                        if text_len > 0 {
+                            let mut buffer = vec![0u16; text_len as usize + 1];
+                            SendMessageW(long_edge_edit, WM_GETTEXT, buffer.len(), buffer.as_mut_ptr() as LPARAM);
+                            if let Ok(long_edge_str) = String::from_utf16(&buffer[..text_len as usize]) {
+                                if let Ok(long_edge) = long_edge_str.parse::<i32>() {
+                                    settings.long_edge_limit = long_edge;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // 获取质量
+                    let quality_trackbar = GetDlgItem(hwnd, IDC_BATCH_QUALITY_TRACKBAR);
+                    if !quality_trackbar.is_null() {
+                        settings.quality = SendMessageW(quality_trackbar, TBM_GETPOS, 0, 0) as i32;
+                    }
+                    
+                    // 获取插值算法
+                    let interpolation_combo = GetDlgItem(hwnd, IDC_BATCH_INTERPOLATION_COMBO);
+                    if !interpolation_combo.is_null() {
+                        let interpolation_index = SendMessageW(interpolation_combo, CB_GETCURSEL, 0, 0) as i32;
+                        settings.interpolation = match interpolation_index {
+                            0 => INTER_NEAREST,
+                            1 => INTER_LINEAR,
+                            2 => INTER_CUBIC,
+                            3 => INTER_AREA,
+                            4 => INTER_LANCZOS4,
+                            _ => INTER_LINEAR,
+                        };
+                    }
+                    
+                    println!("[batch_resize_dialog_proc] 批量缩图设置: {:?}", settings);
+                    
+                    // 验证设置
+                    if settings.input_folder.is_empty() {
+                        let msg = "请选择输入文件夹！";
+                        let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                        let title_utf16: Vec<u16> = "设置错误".encode_utf16().chain(std::iter::once(0)).collect();
+                        MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                        return 0;
+                    }
+                    
+                    if settings.output_folder.is_empty() {
+                        let msg = "请选择输出文件夹！";
+                        let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                        let title_utf16: Vec<u16> = "设置错误".encode_utf16().chain(std::iter::once(0)).collect();
+                        MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                        return 0;
+                    }
+                    
+                    // 关闭对话框
+                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    
+                    // 在新线程中执行批量处理
+                    let settings_clone = settings.clone();
+                    std::thread::spawn(move || {
+                        match batch_resize_images_with_settings(&settings_clone) {
+                            Ok(()) => {
+                                println!("✅ 批量缩图完成！");
+                            }
+                            Err(e) => {
+                                println!("❌ 批量缩图失败：{}", e);
+                            }
+                        }
+                    });
+                }
+                IDC_CANCEL_BUTTON => {
+                    println!("[batch_resize_dialog_proc] 取消按钮被点击");
+                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_NOTIFY => {
+            // 处理质量滑块的通知消息
+            let control_id = (wparam & 0xFFFF) as i32;
+            if control_id == IDC_BATCH_QUALITY_TRACKBAR {
+                let quality_trackbar = GetDlgItem(hwnd, IDC_BATCH_QUALITY_TRACKBAR);
+                if !quality_trackbar.is_null() {
+                    let current_pos = SendMessageW(quality_trackbar, TBM_GETPOS, 0, 0) as i32;
+                    let quality_label = GetDlgItem(hwnd, IDC_BATCH_QUALITY_LABEL);
+                    if !quality_label.is_null() {
+                        let quality_text = match current_pos {
+                            1..=20 => format!("质量: {}% (很低)", current_pos),
+                            21..=40 => format!("质量: {}% (低)", current_pos),
+                            41..=60 => format!("质量: {}% (中等)", current_pos),
+                            61..=80 => format!("质量: {}% (高)", current_pos),
+                            81..=100 => format!("质量: {}% (很高)", current_pos),
+                            _ => format!("质量: {}%", current_pos),
+                        };
+                        let quality_text_utf16: Vec<u16> = quality_text.encode_utf16().chain(std::iter::once(0)).collect();
+                        SetWindowTextW(quality_label, quality_text_utf16.as_ptr());
+                    }
+                }
+            }
+            0
+        }
+        WM_HSCROLL => {
+            // 处理质量滑块的滚动消息
+            let control_id = (wparam & 0xFFFF) as i32;
+            if control_id == IDC_BATCH_QUALITY_TRACKBAR {
+                let quality_trackbar = GetDlgItem(hwnd, IDC_BATCH_QUALITY_TRACKBAR);
+                if !quality_trackbar.is_null() {
+                    let current_pos = SendMessageW(quality_trackbar, TBM_GETPOS, 0, 0) as i32;
+                    let quality_label = GetDlgItem(hwnd, IDC_BATCH_QUALITY_LABEL);
+                    if !quality_label.is_null() {
+                        let quality_text = match current_pos {
+                            1..=20 => format!("质量: {}% (很低)", current_pos),
+                            21..=40 => format!("质量: {}% (低)", current_pos),
+                            41..=60 => format!("质量: {}% (中等)", current_pos),
+                            61..=80 => format!("质量: {}% (高)", current_pos),
+                            81..=100 => format!("质量: {}% (很高)", current_pos),
+                            _ => format!("质量: {}%", current_pos),
+                        };
+                        let quality_text_utf16: Vec<u16> = quality_text.encode_utf16().chain(std::iter::once(0)).collect();
+                        SetWindowTextW(quality_label, quality_text_utf16.as_ptr());
+                    }
+                }
+            }
+            0
+        }
+        WM_CLOSE => {
+            println!("[batch_resize_dialog_proc] 收到 WM_CLOSE，销毁窗口");
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            println!("[batch_resize_dialog_proc] 收到 WM_DESTROY");
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// 新增：显示文件夹选择对话框
+unsafe fn show_folder_dialog(hwnd: HWND) -> Option<String> {
+    // 使用文件对话框来选择文件夹，通过选择文件然后获取其目录
+    let mut file_name = [0u16; 260]; // MAX_PATH
+    let filter = "所有文件\0*.*\0\0";
+    let filter_utf16: Vec<u16> = filter.encode_utf16().collect();
+    let title_utf16: Vec<u16> = "选择包含图像的文件夹\0".encode_utf16().collect();
+
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        hInstance: null_mut(),
+        lpstrFilter: filter_utf16.as_ptr(),
+        lpstrCustomFilter: null_mut(),
+        nMaxCustFilter: 0,
+        nFilterIndex: 1,
+        lpstrFile: file_name.as_mut_ptr(),
+        nMaxFile: file_name.len() as u32,
+        lpstrFileTitle: null_mut(),
+        nMaxFileTitle: 0,
+        lpstrInitialDir: null_mut(),
+        lpstrTitle: title_utf16.as_ptr(),
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+        nFileOffset: 0,
+        nFileExtension: 0,
+        lpstrDefExt: null_mut(),
+        lCustData: 0,
+        lpfnHook: None,
+        lpTemplateName: null_mut(),
+        pvReserved: null_mut(),
+        dwReserved: 0,
+        FlagsEx: 0,
+    };
+
+    if GetOpenFileNameW(&mut ofn) != 0 {
+        // 转换UTF-16路径为String
+        let len = file_name.iter().position(|&c| c == 0).unwrap_or(file_name.len());
+        let path = String::from_utf16_lossy(&file_name[..len]);
+
+        // 获取文件所在目录
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            if let Some(parent_str) = parent.to_str() {
+                return Some(parent_str.to_string());
+            }
+        }
+        None
+    } else {
+        None
+    }
+}
+
+// 新增：使用设置进行批量缩图处理
+fn batch_resize_images_with_settings(settings: &BatchResizeSettings) -> Result<()> {
+    use std::fs;
+    use std::path::Path;
+    
+    println!("开始批量缩图处理...");
+    println!("输入文件夹: {}", settings.input_folder);
+    println!("输出文件夹: {}", settings.output_folder);
+    println!("长边限制: {}", settings.long_edge_limit);
+    println!("质量: {}%", settings.quality);
+    println!("插值算法: {}", match settings.interpolation {
+        INTER_NEAREST => "最近邻插值",
+        INTER_LINEAR => "双线性插值",
+        INTER_CUBIC => "双三次插值",
+        INTER_AREA => "区域插值",
+        INTER_LANCZOS4 => "Lanczos插值",
+        _ => "未知算法",
+    });
+    
+    // 支持的图像扩展名
+    let supported_extensions = ["jpg", "jpeg", "png", "bmp", "tiff", "tif", "webp"];
+
+    // 读取文件夹中的所有文件
+    let entries = fs::read_dir(&settings.input_folder)
+        .context("无法读取输入文件夹")?;
+
+    let mut processed_count = 0;
+    let mut error_count = 0;
+
+    // 创建输出文件夹
+    let output_folder = Path::new(&settings.output_folder);
+    if !output_folder.exists() {
+        fs::create_dir_all(output_folder)
+            .context("无法创建输出文件夹")?;
+    }
+
+    for entry in entries {
+        if let Ok(entry) = entry {
+            let path = entry.path();
+
+            // 检查是否为文件
+            if !path.is_file() {
+                continue;
+            }
+
+            // 检查文件扩展名
+            if let Some(extension) = path.extension() {
+                if let Some(ext_str) = extension.to_str() {
+                    if !supported_extensions.contains(&ext_str.to_lowercase().as_str()) {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+
+            // 处理图像文件
+            match process_single_image_for_batch_with_settings(&path, output_folder, settings) {
+                Ok(()) => {
+                    processed_count += 1;
+                    println!("✅ 处理完成: {}", path.file_name().unwrap().to_string_lossy());
+                }
+                Err(e) => {
+                    error_count += 1;
+                    println!("❌ 处理失败: {} - {}", path.file_name().unwrap().to_string_lossy(), e);
+                }
+            }
+        }
+    }
+
+    println!("批量处理完成！成功: {}, 失败: {}", processed_count, error_count);
+    
+    // 显示完成消息
+    let success_msg = format!("批量缩图完成！\n\n处理文件夹: {}\n输出文件夹: {}\n成功: {} 个文件\n失败: {} 个文件", 
+        settings.input_folder, settings.output_folder, processed_count, error_count);
+    let success_msg_utf16: Vec<u16> = success_msg.encode_utf16().chain(std::iter::once(0)).collect();
+    let title_utf16: Vec<u16> = "批量处理完成".encode_utf16().chain(std::iter::once(0)).collect();
+    
+    unsafe {
+        MessageBoxW(null_mut(), success_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+    }
+    
+    Ok(())
+}
+
+// 新增：使用设置处理单个图像文件
+fn process_single_image_for_batch_with_settings(
+    input_path: &std::path::Path, 
+    output_folder: &std::path::Path,
+    settings: &BatchResizeSettings
+) -> Result<()> {
+    // 加载图像
+    let mat = imgcodecs::imread(input_path.to_str().unwrap(), imgcodecs::IMREAD_COLOR)
+        .context("无法读取图像文件")?;
+
+    if mat.empty() {
+        return Err(anyhow::anyhow!("图像文件为空"));
+    }
+
+    // 获取原始尺寸
+    let original_width = mat.cols();
+    let original_height = mat.rows();
+
+    // 计算新的尺寸（保持宽高比，长边限制为指定值）
+    let (new_width, new_height) = if original_width > original_height {
+        if original_width > settings.long_edge_limit {
+            let ratio = settings.long_edge_limit as f64 / original_width as f64;
+            (settings.long_edge_limit, (original_height as f64 * ratio) as i32)
+        } else {
+            (original_width, original_height)
+        }
+    } else {
+        if original_height > settings.long_edge_limit {
+            let ratio = settings.long_edge_limit as f64 / original_height as f64;
+            ((original_width as f64 * ratio) as i32, settings.long_edge_limit)
+        } else {
+            (original_width, original_height)
+        }
+    };
+
+    // 调整图像大小
+    let resized = if new_width != original_width || new_height != original_height {
+        let mut resized = core::Mat::default();
+        imgproc::resize(&mat, &mut resized, core::Size::new(new_width, new_height), 0.0, 0.0, settings.interpolation);
+        resized
+    } else {
+        mat.clone()
+    };
+
+    // 生成输出文件名
+    let file_name = input_path.file_name().unwrap();
+    let output_path = output_folder.join(file_name);
+
+    // 保存调整后的图像
+    let output_path_str = output_path.to_str().unwrap();
+    if !imgcodecs::imwrite(output_path_str, &resized, &core::Vector::new()).unwrap_or(false) {
+        return Err(anyhow::anyhow!("无法保存调整后的图像"));
+    }
+
+    Ok(())
 }
