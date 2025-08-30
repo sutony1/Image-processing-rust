@@ -39,6 +39,7 @@ const MENU_SAM_EXTRACT_MASK: u32 = 1015; // 新增：抠图并显示
 // 新增：选框工具和裁剪菜单
 const MENU_SELECTION_TOOL: u32 = 1016; // 选框工具
 const MENU_CROP_SELECTION: u32 = 1017; // 裁剪选框区域
+const MENU_BLUR_SELECTION: u32 = 1030; // 涂抹选框区域
 // 新增：调整图像大小菜单
 const MENU_RESIZE_IMAGE: u32 = 1018; // 调整图像大小
 // 新增：图像旋转菜单项
@@ -673,6 +674,10 @@ unsafe fn create_menu() -> HMENU {
     let crop_selection_text = "裁剪选框区域(&C)";
     let crop_selection_utf16: Vec<u16> = crop_selection_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(selection_menu, MF_STRING, MENU_CROP_SELECTION as usize, crop_selection_utf16.as_ptr());
+    
+    let blur_selection_text = "涂抹选框区域(&B)";
+    let blur_selection_text_utf16: Vec<u16> = blur_selection_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(selection_menu, MF_STRING, MENU_BLUR_SELECTION as usize, blur_selection_text_utf16.as_ptr());
     
             let selection_text = "选框工具(&S)";
         let selection_utf16: Vec<u16> = selection_text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1885,6 +1890,23 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             }
         }
         
+        // 新增：涂抹选框区域菜单处理
+        MENU_BLUR_SELECTION => {
+            match blur_selection_area(state) {
+                Ok(()) => {
+                    println!("✅ 选框区域涂抹完成");
+                    InvalidateRect(hwnd, null_mut(), 1);
+                }
+                Err(e) => {
+                    println!("❌ 选框区域涂抹失败: {}", e);
+                    let error_msg = format!("选框区域涂抹失败：\n{}", e);
+                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "涂抹失败".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                }
+            }
+        }
+        
         // 新增：批量缩图菜单处理
         MENU_BATCH_RESIZE => {
             show_batch_resize_dialog(hwnd);
@@ -2440,6 +2462,67 @@ fn crop_selection_area(state: &mut ImageState) -> Result<()> {
     state.end_selection_mode();
     
     println!("✅ 选框区域裁剪完成");
+    Ok(())
+}
+
+// 新增：涂抹选框区域功能
+fn blur_selection_area(state: &mut ImageState) -> Result<()> {
+    use opencv::{imgproc, core as cvcore};
+    
+    if !state.has_selection() {
+        return Err(anyhow::anyhow!("没有可用的选框，请先使用选框工具框选区域"));
+    }
+    
+    let current_img = match &state.current_mat {
+        Some(img) => img,
+        None => {
+            return Err(anyhow::anyhow!("没有可用的图像"));
+        }
+    };
+    
+    let (left, top, right, bottom) = state.get_selection_rect().unwrap();
+    
+    println!("🔍 开始涂抹选框区域...");
+    println!("  选框区域: ({},{}) -> ({},{})", left, top, right, bottom);
+    println!("  选框尺寸: {}x{}", right - left, bottom - top);
+    println!("  原图尺寸: {}x{}", current_img.cols(), current_img.rows());
+    
+    // 确保选框坐标在图像范围内
+    let left = left.max(0).min(current_img.cols() - 1);
+    let top = top.max(0).min(current_img.rows() - 1);
+    let right = right.max(left + 1).min(current_img.cols());
+    let bottom = bottom.max(top + 1).min(current_img.rows());
+    
+    println!("  调整后选框区域: ({},{}) -> ({},{})", left, top, right, bottom);
+    println!("  调整后选框尺寸: {}x{}", right - left, bottom - top);
+    
+    // 创建ROI矩形
+    let roi = cvcore::Rect::new(left, top, right - left, bottom - top);
+    
+    // 提取选框区域（用于验证ROI是否有效）
+    let _selection_roi = match Mat::roi(current_img, roi) {
+        Ok(roi_mat) => roi_mat.try_clone()?,
+        Err(_) => {
+            return Err(anyhow::anyhow!("提取选框区域失败，ROI超出边界"));
+        }
+    };
+    
+    // 创建涂抹后的图像副本
+    let mut blurred_img = current_img.try_clone()?;
+    
+    // 在选框区域应用50%灰色涂抹
+    let gray_color = cvcore::Scalar::new(128.0, 128.0, 128.0, 0.0); // BGR格式，50%灰色
+    
+    // 用50%灰色填充选框区域
+    imgproc::rectangle(&mut blurred_img, roi, gray_color, -1, imgproc::LINE_8, 0)?;
+    
+    // 更新显示
+    state.update_display_from_mat(&blurred_img)?;
+    
+    // 退出选框模式
+    state.end_selection_mode();
+    
+    println!("✅ 选框区域涂抹完成");
     Ok(())
 }
 
