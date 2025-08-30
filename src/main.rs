@@ -28,6 +28,7 @@ const MENU_MORPH_CLOSE: u32 = 1005;
 const MENU_DILATE: u32 = 1006;
 const MENU_FIND_CONTOURS: u32 = 1007;
 const MENU_PERSPECTIVE_TRANSFORM: u32 = 1008;
+const MENU_MANUAL_PERSPECTIVE: u32 = 1031; // 新增：手动透视变换
 const MENU_EXTRACT_COLOR_BLOCKS: u32 = 1009;
 const MENU_TEMPLATE_MATCHING: u32 = 1010;
 const MENU_RESTORE: u32 = 1011;
@@ -182,6 +183,9 @@ struct ImageState {
     straighten_mode: bool, // 是否处于拉直模式
     straighten_start: Option<(i32,i32)>, // 拉直线起始点
     straighten_end: Option<(i32,i32)>, // 拉直线结束点
+    // 新增：手动透视变换相关状态
+    manual_perspective_mode: bool, // 是否处于手动透视变换模式
+    manual_perspective_points: Vec<(i32, i32)>, // 用户选择的四个角点
 }
 
 impl ImageState {
@@ -207,6 +211,8 @@ impl ImageState {
             straighten_mode: false, // 新增：拉直模式
             straighten_start: None, // 新增：拉直线起始点
             straighten_end: None, // 新增：拉直线结束点
+            manual_perspective_mode: false, // 新增：手动透视变换模式
+            manual_perspective_points: Vec::new(), // 新增：用户选择的四个角点
         }
     }
     
@@ -530,9 +536,10 @@ unsafe fn create_menu() -> HMENU {
     let to_gray_utf16: Vec<u16> = to_gray_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(process_menu, MF_STRING, MENU_TO_GRAY as usize, to_gray_utf16.as_ptr());
     
-    let gaussian_text = "高斯模糊(&B)";
-    let gaussian_utf16: Vec<u16> = gaussian_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(process_menu, MF_STRING, MENU_GAUSSIAN as usize, gaussian_utf16.as_ptr());
+    // 暂时隐藏高斯模糊菜单项
+    // let gaussian_text = "高斯模糊(&B)";
+    // let gaussian_utf16: Vec<u16> = gaussian_text.encode_utf16().chain(std::iter::once(0)).collect();
+    // AppendMenuW(process_menu, MF_STRING, MENU_GAUSSIAN as usize, gaussian_utf16.as_ptr());
     
     AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
     
@@ -547,14 +554,14 @@ unsafe fn create_menu() -> HMENU {
     
     AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
     
-    // 形态学操作
-    let morph_text = "形态学闭运算(&M)";
-    let morph_utf16: Vec<u16> = morph_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(process_menu, MF_STRING, MENU_MORPH_CLOSE as usize, morph_utf16.as_ptr());
+    // 形态学操作 - 暂时隐藏
+    // let morph_text = "形态学闭运算(&M)";
+    // let morph_utf16: Vec<u16> = morph_text.encode_utf16().chain(std::iter::once(0)).collect();
+    // AppendMenuW(process_menu, MF_STRING, MENU_MORPH_CLOSE as usize, morph_utf16.as_ptr());
     
-    let dilate_text = "膨胀操作(&D)";
-    let dilate_utf16: Vec<u16> = dilate_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(process_menu, MF_STRING, MENU_DILATE as usize, dilate_utf16.as_ptr());
+    // let dilate_text = "膨胀操作(&D)";
+    // let dilate_utf16: Vec<u16> = dilate_text.encode_utf16().chain(std::iter::once(0)).collect();
+    // AppendMenuW(process_menu, MF_STRING, MENU_DILATE as usize, dilate_utf16.as_ptr());
     
     AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
     
@@ -568,12 +575,17 @@ unsafe fn create_menu() -> HMENU {
     let perspective_utf16: Vec<u16> = perspective_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(process_menu, MF_STRING, MENU_PERSPECTIVE_TRANSFORM as usize, perspective_utf16.as_ptr());
     
+    // 手动透视变换
+    let manual_perspective_text = "手动透视变换(&M)";
+    let manual_perspective_utf16: Vec<u16> = manual_perspective_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(process_menu, MF_STRING, MENU_MANUAL_PERSPECTIVE as usize, manual_perspective_utf16.as_ptr());
+    
     AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
     
-    // 色卡分析
-    let template_match_text = "模板匹配定位色卡(&T)";
-    let template_match_utf16: Vec<u16> = template_match_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(process_menu, MF_STRING, MENU_TEMPLATE_MATCHING as usize, template_match_utf16.as_ptr());
+    // 色卡分析 - 暂时隐藏模板匹配
+    // let template_match_text = "模板匹配定位色卡(&T)";
+    // let template_match_utf16: Vec<u16> = template_match_text.encode_utf16().chain(std::iter::once(0)).collect();
+    // AppendMenuW(process_menu, MF_STRING, MENU_TEMPLATE_MATCHING as usize, template_match_utf16.as_ptr());
     
     let extract_color_text = "读取色卡色块颜色(&E)";
     let extract_color_utf16: Vec<u16> = extract_color_text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1456,6 +1468,26 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 }
             }
         }
+        MENU_MANUAL_PERSPECTIVE => {
+            if let Some(ref current) = state.current_mat.clone() {
+                // 进入手动透视变换模式
+                state.manual_perspective_mode = true;
+                state.manual_perspective_points.clear();
+                
+                let msg = "手动透视变换模式已启动！\n\n请用鼠标左键在图像上依次点击四个角点：\n1. 左上角\n2. 右上角\n3. 右下角\n4. 左下角\n\n点击完成后，程序将自动执行透视变换。\n\n按ESC键可以取消操作。";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "手动透视变换".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                
+                println!("✅ 手动透视变换模式已启动，等待用户选择四个角点...");
+                InvalidateRect(hwnd, null_mut(), 1);
+            } else {
+                let msg = "没有可用的图像，请先加载图像";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "错误".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+            }
+        }
         MENU_TEMPLATE_MATCHING => {
             if let Some(ref scene) = state.current_mat.clone() {
                 println!("开始模板匹配定位色卡...");
@@ -1942,6 +1974,24 @@ unsafe extern "system" fn window_proc(
 			// 我们自己进行背景清除与双缓冲绘制，阻止系统擦除背景以减少闪烁
 			1
 		}
+        WM_KEYDOWN => {
+            let key_code = (wparam & 0xFFFF) as u32;
+            if key_code == 0x1B { // VK_ESCAPE
+                let state = IMAGE_STATE.as_mut().unwrap();
+                if state.manual_perspective_mode {
+                    println!("🔄 用户按ESC键，退出手动透视变换模式");
+                    state.manual_perspective_mode = false;
+                    state.manual_perspective_points.clear();
+                    InvalidateRect(hwnd, null_mut(), 1);
+                    
+                    let msg = "已退出手动透视变换模式";
+                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "操作取消".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                }
+            }
+            0
+        }
         WM_LBUTTONDOWN => {
             let state = IMAGE_STATE.as_mut().unwrap();
             if state.has_image() {
@@ -1960,6 +2010,52 @@ unsafe extern "system" fn window_proc(
                         // 拉直工具模式
                         state.straighten_start = Some((ix, iy));
                         state.straighten_end = Some((ix, iy));
+                    } else if state.manual_perspective_mode {
+                        // 手动透视变换模式
+                        state.manual_perspective_points.push((ix, iy));
+                        println!("✅ 手动透视变换：已选择第 {} 个角点 ({}, {})", 
+                            state.manual_perspective_points.len(), ix, iy);
+                        
+                        // 如果已经选择了4个点，执行透视变换
+                        if state.manual_perspective_points.len() == 4 {
+                            if let Some(ref current) = state.current_mat.clone() {
+                                // 将整数坐标转换为浮点坐标
+                                let points: [core::Point2f; 4] = [
+                                    core::Point2f::new(state.manual_perspective_points[0].0 as f32, state.manual_perspective_points[0].1 as f32),
+                                    core::Point2f::new(state.manual_perspective_points[1].0 as f32, state.manual_perspective_points[1].1 as f32),
+                                    core::Point2f::new(state.manual_perspective_points[2].0 as f32, state.manual_perspective_points[2].1 as f32),
+                                    core::Point2f::new(state.manual_perspective_points[3].0 as f32, state.manual_perspective_points[3].1 as f32),
+                                ];
+                                
+                                match cv_ops::perspective_transform_from_points(&current, points) {
+                                    Ok(transformed) => {
+                                        if let Ok(()) = state.update_display_from_mat(&transformed) {
+                                            println!("✅ 手动透视变换完成");
+                                            // 退出手动透视变换模式
+                                            state.manual_perspective_mode = false;
+                                            state.manual_perspective_points.clear();
+                                            InvalidateRect(hwnd, null_mut(), 1);
+                                            
+                                            let success_msg = "手动透视变换完成！\n\n程序已根据您选择的四个角点完成了透视变换。\n当前显示的是变换后的图像。";
+                                            let success_msg_utf16: Vec<u16> = success_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                            let success_title_utf16: Vec<u16> = "透视变换成功".encode_utf16().chain(std::iter::once(0)).collect();
+                                            MessageBoxW(hwnd, success_msg_utf16.as_ptr(), success_title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("❌ 手动透视变换失败: {}", e);
+                                        let error_msg = format!("透视变换失败：\n{}", e);
+                                        let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                                        let error_title_utf16: Vec<u16> = "透视变换失败".encode_utf16().chain(std::iter::once(0)).collect();
+                                        MessageBoxW(hwnd, error_msg_utf16.as_ptr(), error_title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                                        
+                                        // 退出手动透视变换模式
+                                        state.manual_perspective_mode = false;
+                                        state.manual_perspective_points.clear();
+                                    }
+                                }
+                            }
+                        }
                     }
                     InvalidateRect(hwnd, null_mut(), 1);
                 }
@@ -2236,6 +2332,63 @@ unsafe extern "system" fn window_proc(
                             
                             MoveToEx(mem_dc, wx1, wy1, null_mut());
                             LineTo(mem_dc, wx2, wy2);
+                            
+                            SelectObject(mem_dc, old_pen);
+                            DeleteObject(pen as HGDIOBJ);
+                        }
+                    }
+                    
+                    // 新增：手动透视变换角点绘制
+                    if state.manual_perspective_mode && !state.manual_perspective_points.is_empty() {
+                        // 将图像坐标转换回窗口坐标用于绘制
+                        let to_win = |ix: i32, iy: i32| -> (i32,i32) {
+                            let wx = x + (ix * scaled_width) / state.current_width;
+                            let wy = y + (iy * scaled_height) / state.current_height;
+                            (wx, wy)
+                        };
+                        
+                        // 绘制已选择的角点
+                        let colors = [RGB(255, 0, 0), RGB(0, 255, 0), RGB(0, 0, 255), RGB(255, 255, 0)]; // 红、绿、蓝、黄
+                        for (i, &(ix, iy)) in state.manual_perspective_points.iter().enumerate() {
+                            let (wx, wy) = to_win(ix, iy);
+                            
+                            // 绘制彩色圆点，不同角点用不同颜色
+                            let color = if i < colors.len() { colors[i] } else { RGB(255, 255, 255) };
+                            
+                            let brush = CreateSolidBrush(color);
+                            let old_brush = SelectObject(mem_dc, brush as HGDIOBJ);
+                            
+                            // 绘制圆点（半径8像素）
+                            Ellipse(mem_dc, wx - 8, wy - 8, wx + 8, wy + 8);
+                            
+                            SelectObject(mem_dc, old_brush);
+                            DeleteObject(brush as HGDIOBJ);
+                            
+                            // 在角点旁边显示序号
+                            let num_text = format!("{}", i + 1);
+                            let num_text_utf16: Vec<u16> = num_text.encode_utf16().chain(std::iter::once(0)).collect();
+                            SetTextColor(mem_dc, color);
+                            SetBkMode(mem_dc, TRANSPARENT as i32);
+                            SetBkColor(mem_dc, RGB(0, 0, 0));
+                            TextOutW(mem_dc, wx + 12, wy - 8, num_text_utf16.as_ptr(), num_text.len() as i32);
+                        }
+                        
+                        // 如果已经选择了4个点，绘制连接线
+                        if state.manual_perspective_points.len() == 4 {
+                            let pen = CreatePen(PS_SOLID as i32, 2, RGB(255, 255, 0)); // 黄色连接线
+                            let old_pen = SelectObject(mem_dc, pen as HGDIOBJ);
+                            
+                            // 连接四个角点形成四边形
+                            for i in 0..4 {
+                                let (ix1, iy1) = state.manual_perspective_points[i];
+                                let (ix2, iy2) = state.manual_perspective_points[(i + 1) % 4];
+                                
+                                let (wx1, wy1) = to_win(ix1, iy1);
+                                let (wx2, wy2) = to_win(ix2, iy2);
+                                
+                                MoveToEx(mem_dc, wx1, wy1, null_mut());
+                                LineTo(mem_dc, wx2, wy2);
+                            }
                             
                             SelectObject(mem_dc, old_pen);
                             DeleteObject(pen as HGDIOBJ);
