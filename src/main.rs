@@ -570,10 +570,10 @@ unsafe fn create_menu() -> HMENU {
     let contours_utf16: Vec<u16> = contours_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(process_menu, MF_STRING, MENU_FIND_CONTOURS as usize, contours_utf16.as_ptr());
     
-    // 透视变换
-    let perspective_text = "透视变换(简化)(&P)";
-    let perspective_utf16: Vec<u16> = perspective_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(process_menu, MF_STRING, MENU_PERSPECTIVE_TRANSFORM as usize, perspective_utf16.as_ptr());
+            // 透视变换
+        let perspective_text = "自动透视变换(&P)";
+        let perspective_utf16: Vec<u16> = perspective_text.encode_utf16().chain(std::iter::once(0)).collect();
+        AppendMenuW(process_menu, MF_STRING, MENU_PERSPECTIVE_TRANSFORM as usize, perspective_utf16.as_ptr());
     
     // 手动透视变换
     let manual_perspective_text = "手动透视变换(&M)";
