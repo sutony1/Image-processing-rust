@@ -34,8 +34,7 @@ const MENU_TEMPLATE_MATCHING: u32 = 1010;
 const MENU_RESTORE: u32 = 1011;
 const MENU_SAVE_FILE: u32 = 1012;
 // 添加SAM相关菜单项
-const MENU_SAM_ENCODE: u32 = 1013;
-const MENU_SAM_SEGMENT: u32 = 1014;
+const MENU_SAM_INTERACTIVE: u32 = 1013; // 合并的SAM交互分割抠像菜单
 const MENU_SAM_EXTRACT_MASK: u32 = 1015; // 新增：抠图并显示
 // 新增：选框工具和裁剪菜单
 const MENU_SELECTION_TOOL: u32 = 1016; // 选框工具
@@ -646,13 +645,9 @@ unsafe fn create_menu() -> HMENU {
     
     // 添加SAM菜单
     let sam_menu = CreatePopupMenu();
-    let sam_encode_text = "SAM编码图像(&E)";
-    let sam_encode_utf16: Vec<u16> = sam_encode_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(sam_menu, MF_STRING, MENU_SAM_ENCODE as usize, sam_encode_utf16.as_ptr());
-    
-    let sam_segment_text = "SAM交互分割(&S)";
-    let sam_segment_utf16: Vec<u16> = sam_segment_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(sam_menu, MF_STRING, MENU_SAM_SEGMENT as usize, sam_segment_utf16.as_ptr());
+    let sam_interactive_text = "SAM交互分割抠像(&I)";
+    let sam_interactive_utf16: Vec<u16> = sam_interactive_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(sam_menu, MF_STRING, MENU_SAM_INTERACTIVE as usize, sam_interactive_utf16.as_ptr());
     
     // 新增：抠图并显示命令
     let sam_extract_text = "抠图并显示(&E)";
@@ -1226,6 +1221,13 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 match state.load_image(&file_path) {
                     Ok(()) => {
                         println!("✅ 成功加载图像: {}", file_path);
+                        
+                        // 打开新文件时重置SAM处理器状态，避免上一次的模型影响新文件
+                        if let Some(ref mut sam) = state.sam_processor {
+                            sam.reset();
+                            println!("🔄 SAM处理器已重置，避免影响新打开的文件");
+                        }
+                        
                         // 更新窗口标题（新图像加载时SAM状态为未加载）
                         update_window_title_with_sam_status(hwnd, state, false);
                         InvalidateRect(hwnd, null_mut(), 1);
@@ -1798,8 +1800,9 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
             }
         }
-        MENU_SAM_ENCODE => {
+        MENU_SAM_INTERACTIVE => {
             if let Some(ref current) = state.current_mat.clone() {
+                // 首先初始化SAM处理器并编码图像
                 match state.init_sam_processor() {
                     Ok(()) => {
                         if let Some(ref mut sam) = state.sam_processor {
@@ -1810,7 +1813,11 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                                     // 更新窗口标题显示SAM模型已加载
                                     update_window_title_with_sam_status(hwnd, state, true);
                                     
-                                    // 不再显示对话框，用户可以从窗口标题看到SAM模型已加载
+                                    // 编码成功后立即进入交互分割模式
+                                    state.selecting = true;
+                                    state.select_start = None;
+                                    state.select_end = None;
+                                    println!("🖱️ SAM交互分割：请在图像上按下并拖拽以框选目标，释放鼠标完成框选");
                                 }
                                 Err(e) => {
                                     println!("❌ SAM编码失败: {}", e);
@@ -1837,31 +1844,10 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
             }
         }
-        MENU_SAM_SEGMENT => {
-            if let Some(ref sam) = state.sam_processor {
-                if !sam.is_encoded() {
-                    let msg = "请先使用\"SAM编码图像\"功能对当前图像进行编码";
-                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                    let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
-                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
-                    return;
-                }
-            } else {
-                let msg = "SAM处理器未初始化，请先执行\"SAM编码图像\"";
-                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
-                return;
-            }
-            state.selecting = true;
-            state.select_start = None;
-            state.select_end = None;
-            println!("🖱️ SAM交互分割：请在图像上按下并拖拽以框选目标，释放鼠标完成框选");
-        }
         
         MENU_SAM_EXTRACT_MASK => {
             if !state.has_mask() {
-                let msg = "没有可用的mask，请先进行SAM分割！\n\n使用\"SAM交互分割\"功能在图像上拖拽框选目标，生成mask后再使用此功能。";
+                let msg = "没有可用的mask，请先进行SAM分割！\n\n使用\"SAM交互分割抠像\"功能在图像上拖拽框选目标，生成mask后再使用此功能。";
                 let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
                 let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
                 MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
@@ -1873,7 +1859,7 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                     println!("✅ 抠图并显示完成");
                     InvalidateRect(hwnd, null_mut(), 1);
                     
-                    let msg = "抠图完成！\n\n当前显示的是从原图中裁剪出的mask区域。\n黑色区域表示非mask部分，彩色区域是mask内的原图像素。\n\n您可以使用\"保存文件\"功能保存这个抠图结果。";
+                    let msg = "抠图完成！\n\n当前显示的是从原图中裁剪出的mask区域。\n黑色区域表示非mask部分，彩色区域是mask内的原图像素。\n\n您可以使用\"保存文件\"功能保存这个抠图结果。\n\n注意：SAM模型已在分割完成后重置，下次分割时需要重新编码图像。";
                     let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
                     let title_utf16: Vec<u16> = "抠图成功".encode_utf16().chain(std::iter::once(0)).collect();
                     MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
@@ -2109,6 +2095,12 @@ unsafe extern "system" fn window_proc(
                                                 println!("❌ 叠加分割结果失败: {}", e);
                                             } else {
                                                 InvalidateRect(hwnd, null_mut(), 1);
+                                            }
+                                            
+                                            // SAM分割成功后立即重置处理器状态，为下次分割做准备
+                                            if let Some(ref mut sam) = state.sam_processor {
+                                                sam.reset();
+                                                println!("🔄 SAM处理器已重置，下次分割时需要重新编码图像");
                                             }
                                         }
                                         Err(e) => {

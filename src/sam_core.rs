@@ -29,22 +29,26 @@ impl SAMProcessor {
     pub fn new() -> Result<Self> {
         let env = Arc::new(Environment::builder().with_name("SAM").build()?);
 
-        // 解析模型路径：优先环境变量 -> 可执行目录 -> CWD -> 工程根
+        // 解析模型路径：优先可执行目录 -> 环境变量 -> CWD -> 工程根
         fn resolve_model_path(file: &str) -> std::path::PathBuf {
-            if let Ok(dir) = std::env::var("SAM_MODEL_DIR") {
-                let p = std::path::Path::new(&dir).join(file);
-                if p.exists() { return p; }
-            }
+            // 1. 优先从可执行文件目录查找（便于便携式部署）
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(dir) = exe.parent() {
                     let p = dir.join(file);
                     if p.exists() { return p; }
                 }
             }
+            // 2. 环境变量指定的目录
+            if let Ok(dir) = std::env::var("SAM_MODEL_DIR") {
+                let p = std::path::Path::new(&dir).join(file);
+                if p.exists() { return p; }
+            }
+            // 3. 当前工作目录
             if let Ok(cwd) = std::env::current_dir() {
                 let p = cwd.join(file);
                 if p.exists() { return p; }
             }
+            // 4. 项目根目录（最后备选）
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file)
         }
 
@@ -348,5 +352,16 @@ impl SAMProcessor {
     // 可选：切换 decoder 使用的 orig_im_size 语义（遇到模型差异时用）
     pub fn set_use_new_size_for_decoder(&mut self, yes: bool) {
         self.use_new_size_for_decoder = yes;
+    }
+
+    // 重置SAM处理器状态，清除图像编码但保留模型
+    pub fn reset(&mut self) {
+        self.image_embeddings = None;
+        self.orig_width = 0.0;
+        self.orig_height = 0.0;
+        self.new_w = 0;
+        self.new_h = 0;
+        self.scale = 1.0;
+        println!("🔄 SAM处理器状态已重置");
     }
 }
