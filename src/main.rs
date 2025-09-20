@@ -1,5 +1,5 @@
 use std::ptr::null_mut;
-use winapi::um::winuser::{*, EnableWindow, SetForegroundWindow, LoadCursorW, IDC_ARROW, COLOR_WINDOW, CS_HREDRAW, CS_VREDRAW, UnregisterClassW, EnableMenuItem};
+use winapi::um::winuser::{*, EnableWindow, SetForegroundWindow, LoadCursorW, IDC_ARROW, IDC_HAND, COLOR_WINDOW, CS_HREDRAW, CS_VREDRAW, UnregisterClassW, EnableMenuItem};
 
 use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::wingdi::*;
@@ -187,6 +187,10 @@ struct ImageState {
     manual_perspective_points: Vec<(i32, i32)>, // 用户选择的四个角点
     // 新增：灰度图状态跟踪
     is_grayscale: bool, // 当前图像是否为灰度图或黑白图
+    // 新增：平移相关状态
+    pan_mode: bool, // 是否处于平移模式
+    pan_start: Option<(i32, i32)>, // 平移起始点（窗口坐标）
+    last_pan_offset: (f32, f32), // 上次平移的偏移量
 }
 
 impl ImageState {
@@ -215,6 +219,9 @@ impl ImageState {
             manual_perspective_mode: false, // 新增：手动透视变换模式
             manual_perspective_points: Vec::new(), // 新增：用户选择的四个角点
             is_grayscale: false, // 新增：灰度图状态
+            pan_mode: false, // 新增：平移模式
+            pan_start: None, // 新增：平移起始点
+            last_pan_offset: (0.0, 0.0), // 新增：上次平移偏移量
         }
     }
     
@@ -386,6 +393,9 @@ impl ImageState {
         self.select_end = None;
         self.current_mask = None;
         self.is_grayscale = false; // 重置灰度图状态
+        self.pan_mode = false; // 重置平移状态
+        self.pan_start = None;
+        self.last_pan_offset = (0.0, 0.0);
         println!("🔄 选框工具状态已重置");
     }
 
@@ -403,6 +413,61 @@ impl ImageState {
                 EnableMenuItem(GetMenu(hwnd), MENU_SAM_EXTRACT_MASK as u32, MF_BYCOMMAND | MF_ENABLED);
                 println!("✅ SAM菜单已启用 - 当前图像为彩色图");
             }
+        }
+    }
+
+    // 判断图像是否放大到大于窗口（可以平移）
+    fn can_pan(&self, window_width: i32, window_height: i32) -> bool {
+        if !self.has_image() {
+            return false;
+        }
+        
+        let (_, _, scaled_w, scaled_h) = calculate_scaled_size_with_zoom(self, window_width, window_height);
+        
+        // 如果缩放后的图像尺寸大于窗口尺寸，则可以平移
+        scaled_w > window_width || scaled_h > window_height
+    }
+
+    // 开始平移模式
+    fn start_pan(&mut self, start_x: i32, start_y: i32) {
+        self.pan_mode = true;
+        self.pan_start = Some((start_x, start_y));
+        self.last_pan_offset = (self.zoom_offset_x, self.zoom_offset_y);
+        println!("🖐️ 开始平移模式");
+    }
+
+    // 更新平移偏移
+    fn update_pan(&mut self, current_x: i32, current_y: i32) {
+        if let Some((start_x, start_y)) = self.pan_start {
+            let delta_x = current_x - start_x;
+            let delta_y = current_y - start_y;
+            
+            self.zoom_offset_x = self.last_pan_offset.0 + delta_x as f32;
+            self.zoom_offset_y = self.last_pan_offset.1 + delta_y as f32;
+        }
+    }
+
+    // 结束平移模式
+    fn end_pan(&mut self) {
+        self.pan_mode = false;
+        self.pan_start = None;
+        self.last_pan_offset = (self.zoom_offset_x, self.zoom_offset_y);
+        println!("🖐️ 结束平移模式");
+    }
+
+    // 设置手型光标
+    fn set_hand_cursor(&self, _hwnd: HWND) {
+        unsafe {
+            let hand_cursor = LoadCursorW(null_mut(), IDC_HAND);
+            SetCursor(hand_cursor);
+        }
+    }
+
+    // 设置箭头光标
+    fn set_arrow_cursor(&self, _hwnd: HWND) {
+        unsafe {
+            let arrow_cursor = LoadCursorW(null_mut(), IDC_ARROW);
+            SetCursor(arrow_cursor);
         }
     }
 
@@ -426,6 +491,9 @@ impl ImageState {
         self.straighten_start = None;
         self.straighten_end = None;
         self.is_grayscale = false; // 重置灰度图状态
+        self.pan_mode = false; // 重置平移状态
+        self.pan_start = None;
+        self.last_pan_offset = (0.0, 0.0);
         self.reset_zoom();
         println!("✅ 当前文件已关闭，状态已重置");
     }
@@ -1710,6 +1778,7 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             if let Some(ref original) = state.original_bgr.clone() {
                 if let Ok(()) = state.update_display_from_mat(&original) {
                     state.is_grayscale = false; // 重置为彩色图状态
+                    state.reset_zoom(); // 重置缩放和平移状态，让图像居中显示
                     state.update_sam_menu_state(hwnd); // 更新SAM菜单状态
                     println!("✅ 恢复原图完成");
                     InvalidateRect(hwnd, null_mut(), 1);
@@ -2052,6 +2121,26 @@ unsafe extern "system" fn window_proc(
             if state.has_image() {
                 let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
                 let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+                
+                // 获取窗口尺寸
+                let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                unsafe {
+                    GetClientRect(hwnd, &mut rect);
+                }
+                let window_width = rect.right - rect.left;
+                let window_height = rect.bottom - rect.top;
+                
+                // 检查是否可以平移（图像放大且不在其他模式）
+                if !state.selecting && !state.selection_mode && !state.straighten_mode && !state.manual_perspective_mode {
+                    if state.can_pan(window_width, window_height) {
+                        // 开始平移模式
+                        state.start_pan(mx, my);
+                        state.set_hand_cursor(hwnd);
+                        InvalidateRect(hwnd, null_mut(), 1);
+                        return 0;
+                    }
+                }
+                
                 if let Some((ix, iy)) = window_to_image_coords_with_zoom(hwnd, state, mx, my) {
                     if state.selecting {
                         // SAM交互分割模式
@@ -2118,11 +2207,41 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_MOUSEMOVE => {
-            if (wparam & MK_LBUTTON as usize) != 0 {
-                let state = IMAGE_STATE.as_mut().unwrap();
-                if state.has_image() {
-                    let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
-                    let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+            let state = IMAGE_STATE.as_mut().unwrap();
+            if state.has_image() {
+                let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
+                let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+                
+                // 更新光标（只在没有按下鼠标按钮时）
+                if (wparam & MK_LBUTTON as usize) == 0 && !state.pan_mode {
+                    // 获取窗口尺寸
+                    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    unsafe {
+                        GetClientRect(hwnd, &mut rect);
+                    }
+                    let window_width = rect.right - rect.left;
+                    let window_height = rect.bottom - rect.top;
+                    
+                    // 检查是否可以平移（图像放大且不在其他模式）
+                    if !state.selecting && !state.selection_mode && !state.straighten_mode && !state.manual_perspective_mode {
+                        if state.can_pan(window_width, window_height) {
+                            state.set_hand_cursor(hwnd);
+                        } else {
+                            state.set_arrow_cursor(hwnd);
+                        }
+                    } else {
+                        state.set_arrow_cursor(hwnd);
+                    }
+                }
+                
+                if (wparam & MK_LBUTTON as usize) != 0 {
+                    // 检查是否在平移模式
+                    if state.pan_mode {
+                        state.update_pan(mx, my);
+                        InvalidateRect(hwnd, null_mut(), 0);
+                        return 0;
+                    }
+                    
                     if let Some((ix, iy)) = window_to_image_coords_with_zoom(hwnd, state, mx, my) {
                         if state.selecting {
                             // SAM交互分割模式
@@ -2145,6 +2264,15 @@ unsafe extern "system" fn window_proc(
             if state.has_image() {
                 let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
                 let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+                
+                // 检查是否在平移模式
+                if state.pan_mode {
+                    state.end_pan();
+                    state.set_arrow_cursor(hwnd);
+                    InvalidateRect(hwnd, null_mut(), 1);
+                    return 0;
+                }
+                
                 if let Some((ix, iy)) = window_to_image_coords_with_zoom(hwnd, state, mx, my) {
                     if state.selecting {
                         // SAM交互分割模式
