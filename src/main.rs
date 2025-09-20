@@ -1,5 +1,5 @@
 use std::ptr::null_mut;
-use winapi::um::winuser::{*, EnableWindow, SetForegroundWindow, LoadCursorW, IDC_ARROW, COLOR_WINDOW, CS_HREDRAW, CS_VREDRAW, UnregisterClassW};
+use winapi::um::winuser::{*, EnableWindow, SetForegroundWindow, LoadCursorW, IDC_ARROW, COLOR_WINDOW, CS_HREDRAW, CS_VREDRAW, UnregisterClassW, EnableMenuItem};
 
 use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::wingdi::*;
@@ -185,6 +185,8 @@ struct ImageState {
     // 新增：手动透视变换相关状态
     manual_perspective_mode: bool, // 是否处于手动透视变换模式
     manual_perspective_points: Vec<(i32, i32)>, // 用户选择的四个角点
+    // 新增：灰度图状态跟踪
+    is_grayscale: bool, // 当前图像是否为灰度图或黑白图
 }
 
 impl ImageState {
@@ -212,6 +214,7 @@ impl ImageState {
             straighten_end: None, // 新增：拉直线结束点
             manual_perspective_mode: false, // 新增：手动透视变换模式
             manual_perspective_points: Vec::new(), // 新增：用户选择的四个角点
+            is_grayscale: false, // 新增：灰度图状态
         }
     }
     
@@ -256,6 +259,9 @@ impl ImageState {
         // 重置缩放状态
         self.reset_zoom();
         
+        // 重置选框工具状态
+        self.reset_selection_tools();
+        
         println!("图像加载成功");
         Ok(())
     }
@@ -291,6 +297,9 @@ impl ImageState {
         
         // 重置缩放状态
         self.reset_zoom();
+        
+        // 重置选框工具状态
+        self.reset_selection_tools();
         
         println!("图像加载成功（备用方法）");
         Ok(())
@@ -367,6 +376,36 @@ impl ImageState {
         self.zoom_offset_y = 0.0;
     }
 
+    // 重置选框工具状态
+    fn reset_selection_tools(&mut self) {
+        self.selection_mode = false;
+        self.selection_start = None;
+        self.selection_end = None;
+        self.selecting = false;
+        self.select_start = None;
+        self.select_end = None;
+        self.current_mask = None;
+        self.is_grayscale = false; // 重置灰度图状态
+        println!("🔄 选框工具状态已重置");
+    }
+
+    // 更新SAM菜单的可用性
+    fn update_sam_menu_state(&self, hwnd: HWND) {
+        unsafe {
+            if self.is_grayscale {
+                // 如果是灰度图，禁用SAM菜单项
+                EnableMenuItem(GetMenu(hwnd), MENU_SAM_INTERACTIVE as u32, MF_BYCOMMAND | MF_GRAYED);
+                EnableMenuItem(GetMenu(hwnd), MENU_SAM_EXTRACT_MASK as u32, MF_BYCOMMAND | MF_GRAYED);
+                println!("⚠️ SAM菜单已禁用 - 当前图像为灰度图/黑白图");
+            } else {
+                // 如果是彩色图，启用SAM菜单项
+                EnableMenuItem(GetMenu(hwnd), MENU_SAM_INTERACTIVE as u32, MF_BYCOMMAND | MF_ENABLED);
+                EnableMenuItem(GetMenu(hwnd), MENU_SAM_EXTRACT_MASK as u32, MF_BYCOMMAND | MF_ENABLED);
+                println!("✅ SAM菜单已启用 - 当前图像为彩色图");
+            }
+        }
+    }
+
     // 关闭当前文件，重置到初始状态
     fn close_current_file(&mut self) {
         self.original_bgr = None;
@@ -386,6 +425,7 @@ impl ImageState {
         self.straighten_mode = false;
         self.straighten_start = None;
         self.straighten_end = None;
+        self.is_grayscale = false; // 重置灰度图状态
         self.reset_zoom();
         println!("✅ 当前文件已关闭，状态已重置");
     }
@@ -530,6 +570,13 @@ unsafe fn create_menu() -> HMENU {
     // 创建处理菜单
     let process_menu = CreatePopupMenu();
     
+    // 恢复原图
+    let restore_text = "恢复原图(&R)";
+    let restore_utf16: Vec<u16> = restore_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(process_menu, MF_STRING, MENU_RESTORE as usize, restore_utf16.as_ptr());
+
+    AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
+
     // 基础处理
     let to_gray_text = "转换为灰度图(&G)";
     let to_gray_utf16: Vec<u16> = to_gray_text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -564,10 +611,10 @@ unsafe fn create_menu() -> HMENU {
     
     AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
     
-    // 轮廓检测
-    let contours_text = "轮廓检测(&F)";
-    let contours_utf16: Vec<u16> = contours_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(process_menu, MF_STRING, MENU_FIND_CONTOURS as usize, contours_utf16.as_ptr());
+    // 轮廓检测 - 暂时隐藏
+    // let contours_text = "轮廓检测(&F)";
+    // let contours_utf16: Vec<u16> = contours_text.encode_utf16().chain(std::iter::once(0)).collect();
+    // AppendMenuW(process_menu, MF_STRING, MENU_FIND_CONTOURS as usize, contours_utf16.as_ptr());
     
             // 透视变换
         let perspective_text = "自动透视变换(&P)";
@@ -592,12 +639,6 @@ unsafe fn create_menu() -> HMENU {
     
     AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
     
-    // 恢复原图
-    let restore_text = "恢复原图(&R)";
-    let restore_utf16: Vec<u16> = restore_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(process_menu, MF_STRING, MENU_RESTORE as usize, restore_utf16.as_ptr());
-    
-    AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
     
     // 调整图像大小
     let resize_text = "调整图像大小(&I)";
@@ -865,7 +906,7 @@ unsafe fn update_window_title_with_sam_status(hwnd: HWND, state: &ImageState, sa
     };
     
     let full_title = if sam_loaded {
-        format!("{} - SAM模型已加载", base_title)
+        format!("{} - SAM模型已加载，请按住鼠标左键拖动方框包围对象外围", base_title)
     } else {
         base_title
     };
@@ -1230,6 +1271,10 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                         
                         // 更新窗口标题（新图像加载时SAM状态为未加载）
                         update_window_title_with_sam_status(hwnd, state, false);
+                        
+                        // 更新SAM菜单状态（新图像默认为彩色图）
+                        state.update_sam_menu_state(hwnd);
+                        
                         InvalidateRect(hwnd, null_mut(), 1);
                     }
                     Err(e) => {
@@ -1354,6 +1399,8 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 match cv_ops::to_gray(&current) {
                     Ok(gray) => {
                         if let Ok(()) = state.update_display_from_mat(&gray) {
+                            state.is_grayscale = true; // 设置为灰度图状态
+                            state.update_sam_menu_state(hwnd); // 更新SAM菜单状态
                             println!("✅ 灰度转换完成");
                             InvalidateRect(hwnd, null_mut(), 1);
                         }
@@ -1382,6 +1429,8 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                     .and_then(|blurred| cv_ops::canny(&blurred, 50.0, 150.0)) {
                     Ok(edges) => {
                         if let Ok(()) = state.update_display_from_mat(&edges) {
+                            state.is_grayscale = true; // 设置为灰度图状态
+                            state.update_sam_menu_state(hwnd); // 更新SAM菜单状态
                             println!("✅ Canny边缘检测完成");
                             InvalidateRect(hwnd, null_mut(), 1);
                         }
@@ -1396,6 +1445,8 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                     .and_then(|gray| cv_ops::adaptive_threshold(&gray, 255.0, 11, 2.0)) {
                     Ok(binary) => {
                         if let Ok(()) = state.update_display_from_mat(&binary) {
+                            state.is_grayscale = true; // 设置为灰度图状态
+                            state.update_sam_menu_state(hwnd); // 更新SAM菜单状态
                             println!("✅ 自适应阈值处理完成");
                             InvalidateRect(hwnd, null_mut(), 1);
                         }
@@ -1658,6 +1709,8 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
         MENU_RESTORE => {
             if let Some(ref original) = state.original_bgr.clone() {
                 if let Ok(()) = state.update_display_from_mat(&original) {
+                    state.is_grayscale = false; // 重置为彩色图状态
+                    state.update_sam_menu_state(hwnd); // 更新SAM菜单状态
                     println!("✅ 恢复原图完成");
                     InvalidateRect(hwnd, null_mut(), 1);
                 }
@@ -1801,6 +1854,14 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             }
         }
         MENU_SAM_INTERACTIVE => {
+            if state.is_grayscale {
+                let msg = "SAM分割功能不支持灰度图或黑白图，请使用彩色图像或点击'恢复原图'恢复彩色图像";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "SAM分割限制".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONWARNING);
+                return;
+            }
+            
             if let Some(ref current) = state.current_mat.clone() {
                 // 首先初始化SAM处理器并编码图像
                 match state.init_sam_processor() {
@@ -1846,6 +1907,14 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
         }
         
         MENU_SAM_EXTRACT_MASK => {
+            if state.is_grayscale {
+                let msg = "SAM分割功能不支持灰度图或黑白图，请使用彩色图像或点击'恢复原图'恢复彩色图像";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                let title_utf16: Vec<u16> = "SAM分割限制".encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONWARNING);
+                return;
+            }
+            
             if !state.has_mask() {
                 let msg = "没有可用的mask，请先进行SAM分割！\n\n使用\"SAM交互分割抠像\"功能在图像上拖拽框选目标，生成mask后再使用此功能。";
                 let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
