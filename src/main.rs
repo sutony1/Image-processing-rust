@@ -416,16 +416,15 @@ impl ImageState {
         }
     }
 
-    // 判断图像是否放大到大于窗口（可以平移）
-    fn can_pan(&self, window_width: i32, window_height: i32) -> bool {
+    // 判断是否可以平移图像
+    fn can_pan(&self) -> bool {
         if !self.has_image() {
             return false;
         }
         
-        let (_, _, scaled_w, scaled_h) = calculate_scaled_size_with_zoom(self, window_width, window_height);
-        
-        // 如果缩放后的图像尺寸大于窗口尺寸，则可以平移
-        scaled_w > window_width || scaled_h > window_height
+        // 只要有图像且不在其他工具模式下，就可以平移
+        // 这样用户可以在任何缩放状态下自由移动图像位置
+        true
     }
 
     // 开始平移模式
@@ -2123,16 +2122,9 @@ unsafe extern "system" fn window_proc(
                 let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
                 
                 // 获取窗口尺寸
-                let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-                unsafe {
-                    GetClientRect(hwnd, &mut rect);
-                }
-                let window_width = rect.right - rect.left;
-                let window_height = rect.bottom - rect.top;
-                
-                // 检查是否可以平移（图像放大且不在其他模式）
+                // 检查是否可以平移（不在其他模式）
                 if !state.selecting && !state.selection_mode && !state.straighten_mode && !state.manual_perspective_mode {
-                    if state.can_pan(window_width, window_height) {
+                    if state.can_pan() {
                         // 开始平移模式
                         state.start_pan(mx, my);
                         state.set_hand_cursor(hwnd);
@@ -2214,17 +2206,9 @@ unsafe extern "system" fn window_proc(
                 
                 // 更新光标（只在没有按下鼠标按钮时）
                 if (wparam & MK_LBUTTON as usize) == 0 && !state.pan_mode {
-                    // 获取窗口尺寸
-                    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-                    unsafe {
-                        GetClientRect(hwnd, &mut rect);
-                    }
-                    let window_width = rect.right - rect.left;
-                    let window_height = rect.bottom - rect.top;
-                    
-                    // 检查是否可以平移（图像放大且不在其他模式）
+                    // 检查是否可以平移（不在其他模式）
                     if !state.selecting && !state.selection_mode && !state.straighten_mode && !state.manual_perspective_mode {
-                        if state.can_pan(window_width, window_height) {
+                        if state.can_pan() {
                             state.set_hand_cursor(hwnd);
                         } else {
                             state.set_arrow_cursor(hwnd);
