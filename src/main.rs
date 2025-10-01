@@ -191,6 +191,12 @@ struct ImageState {
     pan_mode: bool, // 是否处于平移模式
     pan_start: Option<(i32, i32)>, // 平移起始点（窗口坐标）
     last_pan_offset: (f32, f32), // 上次平移的偏移量
+    // 新增：悬浮导航箭头相关状态
+    show_nav_arrows: bool, // 是否显示导航箭头
+    mouse_in_left_arrow: bool, // 鼠标是否在左侧箭头区域
+    mouse_in_right_arrow: bool, // 鼠标是否在右侧箭头区域
+    image_list: Vec<String>, // 当前目录的图片文件列表
+    current_image_index: usize, // 当前图片在列表中的索引
 }
 
 impl ImageState {
@@ -222,6 +228,11 @@ impl ImageState {
             pan_mode: false, // 新增：平移模式
             pan_start: None, // 新增：平移起始点
             last_pan_offset: (0.0, 0.0), // 新增：上次平移偏移量
+            show_nav_arrows: false, // 新增：导航箭头显示状态
+            mouse_in_left_arrow: false, // 新增：鼠标在左箭头区域
+            mouse_in_right_arrow: false, // 新增：鼠标在右箭头区域
+            image_list: Vec::new(), // 新增：图片列表
+            current_image_index: 0, // 新增：当前图片索引
         }
     }
     
@@ -269,6 +280,9 @@ impl ImageState {
         // 重置选框工具状态
         self.reset_selection_tools();
         
+        // 更新图片列表
+        self.update_image_list();
+        
         println!("图像加载成功");
         Ok(())
     }
@@ -308,6 +322,9 @@ impl ImageState {
         // 重置选框工具状态
         self.reset_selection_tools();
         
+        // 更新图片列表
+        self.update_image_list();
+        
         println!("图像加载成功（备用方法）");
         Ok(())
     }
@@ -323,6 +340,123 @@ impl ImageState {
     
     fn has_image(&self) -> bool {
         self.original_bgr.is_some()
+    }
+
+    // 新增：更新当前目录的图片列表
+    fn update_image_list(&mut self) {
+        if let Some(ref current_path) = self.current_file_path {
+            self.image_list = Self::get_images_in_directory(current_path);
+            // 找到当前图片在列表中的索引
+            if let Some(index) = self.image_list.iter().position(|p| p == current_path) {
+                self.current_image_index = index;
+            }
+            println!("📁 当前目录共有 {} 张图片，当前是第 {} 张", self.image_list.len(), self.current_image_index + 1);
+        }
+    }
+
+    // 新增：获取指定图片所在目录的所有图片文件
+    fn get_images_in_directory(current_file: &str) -> Vec<String> {
+        use std::path::Path;
+        use std::fs;
+        
+        let path = Path::new(current_file);
+        let dir = match path.parent() {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+        
+        let mut images = Vec::new();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Ok(path) = entry.path().canonicalize() {
+                    if let Some(ext) = path.extension() {
+                        let ext_lower = ext.to_string_lossy().to_lowercase();
+                        if matches!(ext_lower.as_str(), "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "tif") {
+                            if let Some(path_str) = path.to_str() {
+                                images.push(path_str.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 按文件名排序
+        images.sort();
+        images
+    }
+
+    // 新增：加载下一张图片
+    fn load_next_image(&mut self) -> Result<()> {
+        if self.image_list.is_empty() {
+            return Err(anyhow::anyhow!("图片列表为空"));
+        }
+        
+        if self.current_image_index < self.image_list.len() - 1 {
+            self.current_image_index += 1;
+            let next_path = self.image_list[self.current_image_index].clone();
+            self.load_image(&next_path)?;
+            println!("➡️ 加载下一张图片 ({}/{})", self.current_image_index + 1, self.image_list.len());
+        } else {
+            println!("⚠️ 已经是最后一张图片了");
+        }
+        Ok(())
+    }
+
+    // 新增：加载上一张图片
+    fn load_previous_image(&mut self) -> Result<()> {
+        if self.image_list.is_empty() {
+            return Err(anyhow::anyhow!("图片列表为空"));
+        }
+        
+        if self.current_image_index > 0 {
+            self.current_image_index -= 1;
+            let prev_path = self.image_list[self.current_image_index].clone();
+            self.load_image(&prev_path)?;
+            println!("⬅️ 加载上一张图片 ({}/{})", self.current_image_index + 1, self.image_list.len());
+        } else {
+            println!("⚠️ 已经是第一张图片了");
+        }
+        Ok(())
+    }
+
+    // 新增：检查是否可以导航到上一张
+    fn can_go_previous(&self) -> bool {
+        !self.image_list.is_empty() && self.current_image_index > 0
+    }
+
+    // 新增：检查是否可以导航到下一张
+    fn can_go_next(&self) -> bool {
+        !self.image_list.is_empty() && self.current_image_index < self.image_list.len() - 1
+    }
+
+    // 新增：更新鼠标位置并检测是否在箭头区域
+    fn update_nav_arrows(&mut self, mx: i32, my: i32, window_width: i32, window_height: i32) {
+        // 箭头区域：窗口左侧和右侧各100像素宽的区域
+        const ARROW_AREA_WIDTH: i32 = 100;
+        const ARROW_AREA_HEIGHT: i32 = 80; // 箭头高度
+        
+        // 左侧箭头区域：垂直居中
+        let left_arrow_top = (window_height - ARROW_AREA_HEIGHT) / 2;
+        let left_arrow_bottom = left_arrow_top + ARROW_AREA_HEIGHT;
+        self.mouse_in_left_arrow = mx < ARROW_AREA_WIDTH 
+            && my >= left_arrow_top 
+            && my <= left_arrow_bottom
+            && self.can_go_previous();
+        
+        // 右侧箭头区域：垂直居中
+        let right_arrow_left = window_width - ARROW_AREA_WIDTH;
+        let right_arrow_top = (window_height - ARROW_AREA_HEIGHT) / 2;
+        let right_arrow_bottom = right_arrow_top + ARROW_AREA_HEIGHT;
+        self.mouse_in_right_arrow = mx >= right_arrow_left 
+            && my >= right_arrow_top 
+            && my <= right_arrow_bottom
+            && self.can_go_next();
+        
+        // 如果鼠标在箭头区域或者图片列表有多张图，显示箭头
+        self.show_nav_arrows = (self.mouse_in_left_arrow || self.mouse_in_right_arrow || 
+                                mx < ARROW_AREA_WIDTH || mx >= right_arrow_left) 
+                                && self.image_list.len() > 1;
     }
 
     fn init_sam_processor(&mut self) -> Result<()> {
@@ -2121,6 +2255,21 @@ unsafe extern "system" fn window_proc(
                 let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
                 let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
                 
+                // 检查是否点击了导航箭头
+                if state.mouse_in_left_arrow {
+                    if let Err(e) = state.load_previous_image() {
+                        println!("❌ 加载上一张图片失败: {}", e);
+                    }
+                    InvalidateRect(hwnd, null_mut(), 0);
+                    return 0;
+                } else if state.mouse_in_right_arrow {
+                    if let Err(e) = state.load_next_image() {
+                        println!("❌ 加载下一张图片失败: {}", e);
+                    }
+                    InvalidateRect(hwnd, null_mut(), 0);
+                    return 0;
+                }
+                
                 // 获取窗口尺寸
                 // 检查是否可以平移（不在其他模式）
                 if !state.selecting && !state.selection_mode && !state.straighten_mode && !state.manual_perspective_mode {
@@ -2203,6 +2352,21 @@ unsafe extern "system" fn window_proc(
             if state.has_image() {
                 let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
                 let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+                
+                // 获取窗口尺寸用于更新导航箭头
+                let mut rect: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut rect);
+                let window_width = rect.right - rect.left;
+                let window_height = rect.bottom - rect.top;
+                
+                // 更新导航箭头状态
+                let old_show_arrows = state.show_nav_arrows;
+                state.update_nav_arrows(mx, my, window_width, window_height);
+                
+                // 如果箭头显示状态改变，触发重绘
+                if old_show_arrows != state.show_nav_arrows {
+                    InvalidateRect(hwnd, null_mut(), 0);
+                }
                 
                 // 更新光标（只在没有按下鼠标按钮时）
                 if (wparam & MK_LBUTTON as usize) == 0 && !state.pan_mode {
@@ -2590,6 +2754,85 @@ unsafe extern "system" fn window_proc(
                         &mut rect,
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                     );
+                }
+            }
+
+            // 绘制导航箭头
+            if let Some(ref state) = IMAGE_STATE {
+                if state.show_nav_arrows && state.has_image() {
+                    const ARROW_SIZE: i32 = 40; // 箭头大小
+                    const ARROW_AREA_WIDTH: i32 = 100;
+                    
+                    // 计算箭头位置（垂直居中）
+                    let arrow_y = (window_height - ARROW_SIZE) / 2;
+                    
+                    // 左侧箭头（如果可以向前导航）
+                    if state.can_go_previous() {
+                        let arrow_x = (ARROW_AREA_WIDTH - ARROW_SIZE) / 2;
+                        
+                        // 绘制圆形背景
+                        let bg_color = if state.mouse_in_left_arrow { RGB(80, 80, 80) } else { RGB(50, 50, 50) };
+                        let brush = CreateSolidBrush(bg_color);
+                        let old_brush = SelectObject(mem_dc, brush as HGDIOBJ);
+                        let pen = CreatePen(PS_SOLID as i32, 1, RGB(150, 150, 150));
+                        let old_pen = SelectObject(mem_dc, pen as HGDIOBJ);
+                        
+                        Ellipse(mem_dc, arrow_x, arrow_y, arrow_x + ARROW_SIZE, arrow_y + ARROW_SIZE);
+                        
+                        SelectObject(mem_dc, old_brush);
+                        SelectObject(mem_dc, old_pen);
+                        DeleteObject(brush as HGDIOBJ);
+                        DeleteObject(pen as HGDIOBJ);
+                        
+                        // 绘制左箭头 <
+                        let white_pen = CreatePen(PS_SOLID as i32, 3, RGB(255, 255, 255));
+                        let old_pen = SelectObject(mem_dc, white_pen as HGDIOBJ);
+                        
+                        let cx = arrow_x + ARROW_SIZE / 2;
+                        let cy = arrow_y + ARROW_SIZE / 2;
+                        let offset = 10;
+                        
+                        MoveToEx(mem_dc, cx + offset / 2, cy - offset, null_mut());
+                        LineTo(mem_dc, cx - offset / 2, cy);
+                        LineTo(mem_dc, cx + offset / 2, cy + offset);
+                        
+                        SelectObject(mem_dc, old_pen);
+                        DeleteObject(white_pen as HGDIOBJ);
+                    }
+                    
+                    // 右侧箭头（如果可以向后导航）
+                    if state.can_go_next() {
+                        let arrow_x = window_width - ARROW_AREA_WIDTH + (ARROW_AREA_WIDTH - ARROW_SIZE) / 2;
+                        
+                        // 绘制圆形背景
+                        let bg_color = if state.mouse_in_right_arrow { RGB(80, 80, 80) } else { RGB(50, 50, 50) };
+                        let brush = CreateSolidBrush(bg_color);
+                        let old_brush = SelectObject(mem_dc, brush as HGDIOBJ);
+                        let pen = CreatePen(PS_SOLID as i32, 1, RGB(150, 150, 150));
+                        let old_pen = SelectObject(mem_dc, pen as HGDIOBJ);
+                        
+                        Ellipse(mem_dc, arrow_x, arrow_y, arrow_x + ARROW_SIZE, arrow_y + ARROW_SIZE);
+                        
+                        SelectObject(mem_dc, old_brush);
+                        SelectObject(mem_dc, old_pen);
+                        DeleteObject(brush as HGDIOBJ);
+                        DeleteObject(pen as HGDIOBJ);
+                        
+                        // 绘制右箭头 >
+                        let white_pen = CreatePen(PS_SOLID as i32, 3, RGB(255, 255, 255));
+                        let old_pen = SelectObject(mem_dc, white_pen as HGDIOBJ);
+                        
+                        let cx = arrow_x + ARROW_SIZE / 2;
+                        let cy = arrow_y + ARROW_SIZE / 2;
+                        let offset = 10;
+                        
+                        MoveToEx(mem_dc, cx - offset / 2, cy - offset, null_mut());
+                        LineTo(mem_dc, cx + offset / 2, cy);
+                        LineTo(mem_dc, cx - offset / 2, cy + offset);
+                        
+                        SelectObject(mem_dc, old_pen);
+                        DeleteObject(white_pen as HGDIOBJ);
+                    }
                 }
             }
 
