@@ -17,6 +17,7 @@ use anyhow::{Result, Context};
 mod ocv_bridge;
 mod cv_ops;
 mod sam_core;
+mod wia_scanner;
 
 // 菜单项ID常量
 const MENU_OPEN_FILE: u32 = 1000;
@@ -59,6 +60,8 @@ const MENU_STRAIGHTEN_HORIZONTAL: u32 = 1027; // 水平校正
 // 新增：批量处理菜单项
 const MENU_BATCH_PROCESS: u32 = 1028; // 批量处理菜单
 const MENU_BATCH_RESIZE: u32 = 1029; // 批量缩图
+// 新增：WIA图像采集菜单项
+const MENU_WIA_IMPORT: u32 = 1032; // 导入(WIA支持)
 
 // 滑块控件常量
 const TBS_HORZ: u32 = 0x0000;
@@ -751,6 +754,14 @@ unsafe fn create_menu() -> HMENU {
     let open_file_text = "打开文件(&O)...";
     let open_file_utf16: Vec<u16> = open_file_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(file_menu, MF_STRING, MENU_OPEN_FILE as usize, open_file_utf16.as_ptr());
+    
+    // 添加WIA导入菜单项
+    let wia_import_text = "导入(WIA支持)(&W)...";
+    let wia_import_utf16: Vec<u16> = wia_import_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(file_menu, MF_STRING, MENU_WIA_IMPORT as usize, wia_import_utf16.as_ptr());
+    
+    AppendMenuW(file_menu, MF_SEPARATOR, 0, null_mut());
+    
     let save_file_text = "保存文件(&S)...";
     let save_file_utf16: Vec<u16> = save_file_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(file_menu, MF_STRING, MENU_SAVE_FILE as usize, save_file_utf16.as_ptr());
@@ -1485,6 +1496,57 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                         let title_utf16: Vec<u16> = "加载错误".encode_utf16().chain(std::iter::once(0)).collect();
                         MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
                     }
+                }
+            }
+        }
+        MENU_WIA_IMPORT => {
+            println!("🖨️ 用户点击了WIA导入菜单");
+            // Convert winapi HWND to windows crate HWND
+            let hwnd_windows = windows::Win32::Foundation::HWND(hwnd as *mut std::ffi::c_void);
+            match wia_scanner::acquire_image_from_scanner(hwnd_windows, None) {
+                Ok(scanned_file_path) => {
+                    println!("✅ 扫描完成，图像保存到: {}", scanned_file_path);
+                    
+                    // 自动加载扫描到的图像
+                    match state.load_image(&scanned_file_path) {
+                        Ok(()) => {
+                            println!("✅ 成功加载扫描图像");
+                            
+                            // 重置SAM处理器状态
+                            if let Some(ref mut sam) = state.sam_processor {
+                                sam.reset();
+                                println!("🔄 SAM处理器已重置");
+                            }
+                            
+                            // 更新窗口标题
+                            update_window_title_with_sam_status(hwnd, state, false);
+                            
+                            // 更新SAM菜单状态
+                            state.update_sam_menu_state(hwnd);
+                            
+                            InvalidateRect(hwnd, null_mut(), 1);
+                            
+                            // 显示成功提示
+                            let success_msg = format!("扫描完成！\n\n图像已保存到:\n{}\n\n图像已自动打开。", scanned_file_path);
+                            let success_msg_utf16: Vec<u16> = success_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                            let title_utf16: Vec<u16> = "扫描成功".encode_utf16().chain(std::iter::once(0)).collect();
+                            MessageBoxW(hwnd, success_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                        }
+                        Err(e) => {
+                            println!("❌ 加载扫描图像失败: {}", e);
+                            let error_msg = format!("扫描完成，但无法加载图像:\n{}\n\n错误信息: {}", scanned_file_path, e);
+                            let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                            let title_utf16: Vec<u16> = "加载错误".encode_utf16().chain(std::iter::once(0)).collect();
+                            MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("❌ WIA扫描失败: {}", e);
+                    let error_msg = format!("扫描操作失败:\n\n{}\n\n请检查:\n1. 扫描仪是否已连接并开机\n2. 扫描仪驱动是否已正确安装\n3. WIA服务是否正常运行", e);
+                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "扫描失败".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
                 }
             }
         }
