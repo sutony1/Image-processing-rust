@@ -200,6 +200,10 @@ struct ImageState {
     mouse_in_right_arrow: bool, // 鼠标是否在右侧箭头区域
     image_list: Vec<String>, // 当前目录的图片文件列表
     current_image_index: usize, // 当前图片在列表中的索引
+    // 新增：智能加载相关状态
+    display_max_size: i32, // 显示用的最大尺寸限制（默认2048px）
+    full_resolution_path: Option<String>, // 原图文件路径
+    is_full_resolution_loaded: bool, // 当前original_bgr是否为完整分辨率
 }
 
 impl ImageState {
@@ -236,6 +240,9 @@ impl ImageState {
             mouse_in_right_arrow: false, // 新增：鼠标在右箭头区域
             image_list: Vec::new(), // 新增：图片列表
             current_image_index: 0, // 新增：当前图片索引
+            display_max_size: 2048, // 新增：显示最大尺寸
+            full_resolution_path: None, // 新增：完整分辨率路径
+            is_full_resolution_loaded: false, // 新增：是否已加载完整分辨率
         }
     }
     
@@ -247,8 +254,34 @@ impl ImageState {
             return Err(anyhow::anyhow!("文件不存在: {}", path));
         }
         
+        // 使用image库快速获取图片尺寸（不解码全图）
+        let (img_w, img_h) = match image::io::Reader::open(path) {
+            Ok(reader) => {
+                match reader.into_dimensions() {
+                    Ok(dimensions) => dimensions,
+                    Err(_) => {
+                        // 如果获取尺寸失败，回退到备用方法
+                        println!("无法获取图片尺寸，使用备用方法");
+                        return self.load_image_fallback(path);
+                    }
+                }
+            }
+            Err(_) => {
+                // 如果打开文件失败，回退到备用方法
+                println!("无法打开图片文件，使用备用方法");
+                return self.load_image_fallback(path);
+            }
+        };
+        
+        let max_dim = img_w.max(img_h);
+        let is_large_image = max_dim > self.display_max_size as u32;
+        
+        if is_large_image {
+            println!("🔍 检测到大图 ({}x{})，加载缩小版本以提升速度", img_w, img_h);
+        }
+        
         // 尝试使用OpenCV读取图像为BGR格式
-        let bgr = match imgcodecs::imread(path, imgcodecs::IMREAD_COLOR) {
+        let mut bgr = match imgcodecs::imread(path, imgcodecs::IMREAD_COLOR) {
             Ok(mat) => {
                 if mat.empty() {
                     // 如果OpenCV返回空图像，尝试备用方法
@@ -264,46 +297,21 @@ impl ImageState {
             }
         };
         
-        println!("图像尺寸: {}x{}, 通道数: {}", bgr.cols(), bgr.rows(), bgr.channels());
-        
-        // 转换为显示像素
-        let image_buf = ocv_bridge::mat_to_bgra(&bgr)?;
-        
-        let bgr_clone = bgr.try_clone()?;
-        self.original_bgr = Some(bgr);
-        self.current_mat = Some(bgr_clone);
-        self.display_pixels = image_buf.pixels;
-        self.current_width = image_buf.w;
-        self.current_height = image_buf.h;
-        self.current_file_path = Some(path.to_string()); // 存储文件路径
-        
-        // 重置缩放状态
-        self.reset_zoom();
-        
-        // 重置选框工具状态
-        self.reset_selection_tools();
-        
-        // 更新图片列表
-        self.update_image_list();
-        
-        println!("图像加载成功");
-        Ok(())
-    }
-    
-    fn load_image_fallback(&mut self, path: &str) -> Result<()> {
-        println!("使用备用方法加载图像...");
-        
-        // 使用标准库读取文件到内存
-        let image_data = std::fs::read(path)
-            .context("无法读取图像文件到内存")?;
-        
-        // 使用OpenCV从内存数据解码图像
-        let data_vec = opencv::core::Vector::from_slice(&image_data);
-        let bgr = imgcodecs::imdecode(&data_vec, imgcodecs::IMREAD_COLOR)
-            .context("无法解码图像数据")?;
-        
-        if bgr.empty() {
-            return Err(anyhow::anyhow!("解码后的图像为空，可能是不支持的格式"));
+        // 如果是大图，缩小到display_max_size
+        if is_large_image {
+            let scale = self.display_max_size as f32 / max_dim as f32;
+            let new_w = (img_w as f32 * scale) as i32;
+            let new_h = (img_h as f32 * scale) as i32;
+            
+            let mut resized = core::Mat::default();
+            imgproc::resize(&bgr, &mut resized, 
+                core::Size::new(new_w, new_h), 
+                0.0, 0.0, 
+                imgproc::INTER_AREA)
+                .context("缩放图像失败")?;
+            
+            bgr = resized;
+            println!("✅ 已缩放至: {}x{}", new_w, new_h);
         }
         
         println!("图像尺寸: {}x{}, 通道数: {}", bgr.cols(), bgr.rows(), bgr.channels());
@@ -319,6 +327,10 @@ impl ImageState {
         self.current_height = image_buf.h;
         self.current_file_path = Some(path.to_string()); // 存储文件路径
         
+        // 更新智能加载状态
+        self.full_resolution_path = Some(path.to_string());
+        self.is_full_resolution_loaded = !is_large_image;
+        
         // 重置缩放状态
         self.reset_zoom();
         
@@ -328,7 +340,83 @@ impl ImageState {
         // 更新图片列表
         self.update_image_list();
         
-        println!("图像加载成功（备用方法）");
+        if is_large_image {
+            println!("⚡ 图像快速加载完成（使用缩小版本）");
+        } else {
+            println!("✅ 图像加载完成");
+        }
+        Ok(())
+    }
+    
+    fn load_image_fallback(&mut self, path: &str) -> Result<()> {
+        println!("使用备用方法加载图像...");
+        
+        // 使用标准库读取文件到内存
+        let image_data = std::fs::read(path)
+            .context("无法读取图像文件到内存")?;
+        
+        // 使用OpenCV从内存数据解码图像
+        let data_vec = opencv::core::Vector::from_slice(&image_data);
+        let mut bgr = imgcodecs::imdecode(&data_vec, imgcodecs::IMREAD_COLOR)
+            .context("无法解码图像数据")?;
+        
+        if bgr.empty() {
+            return Err(anyhow::anyhow!("解码后的图像为空，可能是不支持的格式"));
+        }
+        
+        let img_w = bgr.cols() as u32;
+        let img_h = bgr.rows() as u32;
+        let max_dim = img_w.max(img_h);
+        let is_large_image = max_dim > self.display_max_size as u32;
+        
+        if is_large_image {
+            println!("🔍 检测到大图 ({}x{})，缩小以提升速度", img_w, img_h);
+            let scale = self.display_max_size as f32 / max_dim as f32;
+            let new_w = (img_w as f32 * scale) as i32;
+            let new_h = (img_h as f32 * scale) as i32;
+            
+            let mut resized = core::Mat::default();
+            imgproc::resize(&bgr, &mut resized, 
+                core::Size::new(new_w, new_h), 
+                0.0, 0.0, 
+                imgproc::INTER_AREA)
+                .context("缩放图像失败")?;
+            
+            bgr = resized;
+            println!("✅ 已缩放至: {}x{}", new_w, new_h);
+        }
+        
+        println!("图像尺寸: {}x{}, 通道数: {}", bgr.cols(), bgr.rows(), bgr.channels());
+        
+        // 转换为显示像素
+        let image_buf = ocv_bridge::mat_to_bgra(&bgr)?;
+        
+        let bgr_clone = bgr.try_clone()?;
+        self.original_bgr = Some(bgr);
+        self.current_mat = Some(bgr_clone);
+        self.display_pixels = image_buf.pixels;
+        self.current_width = image_buf.w;
+        self.current_height = image_buf.h;
+        self.current_file_path = Some(path.to_string()); // 存储文件路径
+        
+        // 更新智能加载状态
+        self.full_resolution_path = Some(path.to_string());
+        self.is_full_resolution_loaded = !is_large_image;
+        
+        // 重置缩放状态
+        self.reset_zoom();
+        
+        // 重置选框工具状态
+        self.reset_selection_tools();
+        
+        // 更新图片列表
+        self.update_image_list();
+        
+        if is_large_image {
+            println!("⚡ 图像快速加载完成（备用方法，使用缩小版本）");
+        } else {
+            println!("✅ 图像加载成功（备用方法）");
+        }
         Ok(())
     }
     
@@ -343,6 +431,38 @@ impl ImageState {
     
     fn has_image(&self) -> bool {
         self.original_bgr.is_some()
+    }
+
+    // 新增：按需加载完整分辨率图像
+    fn ensure_full_resolution(&mut self) -> Result<()> {
+        // 如果已经是完整分辨率，直接返回
+        if self.is_full_resolution_loaded {
+            return Ok(());
+        }
+        
+        // 获取原图路径
+        let path = self.full_resolution_path.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无文件路径"))?
+            .clone();
+        
+        println!("⏳ 加载完整分辨率图像: {}", path);
+        
+        // 加载完整分辨率图像
+        let full_bgr = imgcodecs::imread(&path, imgcodecs::IMREAD_COLOR)
+            .context("无法读取完整分辨率图像")?;
+        
+        if full_bgr.empty() {
+            return Err(anyhow::anyhow!("加载完整分辨率失败：图像为空"));
+        }
+        
+        println!("✅ 完整分辨率加载完成: {}x{}", full_bgr.cols(), full_bgr.rows());
+        
+        // 更新状态
+        self.original_bgr = Some(full_bgr.try_clone()?);
+        self.current_mat = Some(full_bgr);
+        self.is_full_resolution_loaded = true;
+        
+        Ok(())
     }
 
     // 新增：更新当前目录的图片列表
@@ -629,6 +749,9 @@ impl ImageState {
         self.is_grayscale = false; // 重置灰度图状态
         self.pan_mode = false; // 重置平移状态
         self.pan_start = None;
+        // 重置智能加载状态
+        self.full_resolution_path = None;
+        self.is_full_resolution_loaded = false;
         self.last_pan_offset = (0.0, 0.0);
         self.reset_zoom();
         println!("✅ 当前文件已关闭，状态已重置");
@@ -1552,8 +1675,15 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
         }
         MENU_SAVE_FILE => {
             if let Some(ref mat) = state.current_mat {
+                // 确保加载完整分辨率以保存最佳质量
+                if let Err(e) = state.ensure_full_resolution() {
+                    println!("⚠️ 无法加载完整分辨率: {}，将保存当前版本", e);
+                }
+                
                 if let Some(path) = show_save_file_dialog(hwnd) {
-                    match save_mat_with_unicode_path(mat, &path) {
+                    // 重新获取mat（可能已更新为完整分辨率）
+                    let mat_to_save = state.current_mat.as_ref().unwrap();
+                    match save_mat_with_unicode_path(mat_to_save, &path) {
                         Ok(final_path) => {
                             println!("✅ 已保存: {}", final_path);
                         }
@@ -1763,8 +1893,20 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
         }
         MENU_PERSPECTIVE_TRANSFORM => {
             if let Some(ref current) = state.current_mat.clone() {
+                // 确保加载完整分辨率（透视变换需要高质量）
+                if let Err(e) = state.ensure_full_resolution() {
+                    println!("❌ 加载完整分辨率失败: {}", e);
+                    let error_msg = format!("无法加载完整分辨率图像：{}", e);
+                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "错误".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                    return;
+                }
+                
                 println!("开始简化透视变换...");
-                match cv_ops::perspective_transform_simplified(&current) {
+                // 重新获取mat（可能已更新为完整分辨率）
+                let current_mat = state.current_mat.as_ref().unwrap();
+                match cv_ops::perspective_transform_simplified(current_mat) {
                     Ok(Some(transformed)) => {
                         if let Ok(()) = state.update_display_from_mat(&transformed) {
                             println!("✅ 简化透视变换完成");
@@ -1786,6 +1928,16 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
         }
         MENU_MANUAL_PERSPECTIVE => {
             if let Some(ref current) = state.current_mat.clone() {
+                // 确保加载完整分辨率（透视变换需要高质量）
+                if let Err(e) = state.ensure_full_resolution() {
+                    println!("❌ 加载完整分辨率失败: {}", e);
+                    let error_msg = format!("无法加载完整分辨率图像：{}", e);
+                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title_utf16: Vec<u16> = "错误".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                    return;
+                }
+                
                 // 进入手动透视变换模式
                 state.manual_perspective_mode = true;
                 state.manual_perspective_points.clear();
@@ -3049,6 +3201,9 @@ fn crop_selection_area(state: &mut ImageState) -> Result<()> {
         return Err(anyhow::anyhow!("没有可用的选框，请先使用选框工具框选区域"));
     }
     
+    // 确保加载完整分辨率（裁剪需要保持最佳质量）
+    state.ensure_full_resolution()?;
+    
     let current_img = match &state.current_mat {
         Some(img) => img,
         None => {
@@ -4252,12 +4407,53 @@ unsafe fn handle_drop_files(hwnd: HWND, hdrop: HDROP) {
 fn load_image_from_path(file_path: &str) -> Result<()> {
     let state = unsafe { IMAGE_STATE.as_mut().unwrap() };
     
+    // 使用image库快速获取图片尺寸（不解码全图）
+    let (img_w, img_h) = match image::io::Reader::open(file_path) {
+        Ok(reader) => {
+            match reader.into_dimensions() {
+                Ok(dimensions) => dimensions,
+                Err(_) => {
+                    println!("无法获取图片尺寸，尝试直接加载");
+                    (0, 0) // 标记为未知尺寸
+                }
+            }
+        }
+        Err(_) => {
+            println!("无法打开图片文件，尝试直接加载");
+            (0, 0) // 标记为未知尺寸
+        }
+    };
+    
+    let max_dim = img_w.max(img_h);
+    let is_large_image = max_dim > 0 && max_dim > state.display_max_size as u32;
+    
+    if is_large_image {
+        println!("🔍 检测到大图 ({}x{})，加载缩小版本以提升速度", img_w, img_h);
+    }
+    
     // 使用OpenCV加载图像
-    let mat = imgcodecs::imread(file_path, imgcodecs::IMREAD_COLOR)
+    let mut mat = imgcodecs::imread(file_path, imgcodecs::IMREAD_COLOR)
         .context("无法读取图像文件")?;
     
     if mat.empty() {
         return Err(anyhow::anyhow!("图像文件为空或格式不受支持"));
+    }
+    
+    // 如果是大图，缩小到display_max_size
+    if is_large_image {
+        let scale = state.display_max_size as f32 / max_dim as f32;
+        let new_w = (img_w as f32 * scale) as i32;
+        let new_h = (img_h as f32 * scale) as i32;
+        
+        let mut resized = core::Mat::default();
+        imgproc::resize(&mat, &mut resized, 
+            core::Size::new(new_w, new_h), 
+            0.0, 0.0, 
+            imgproc::INTER_AREA)
+            .context("缩放图像失败")?;
+        
+        mat = resized;
+        println!("✅ 已缩放至: {}x{}", new_w, new_h);
     }
     
     // 转换为显示格式
@@ -4272,10 +4468,21 @@ fn load_image_from_path(file_path: &str) -> Result<()> {
             state.original_bgr = Some(mat.clone());
             state.current_mat = Some(mat);
             
+            // 更新智能加载状态
+            state.full_resolution_path = Some(file_path.to_string());
+            state.is_full_resolution_loaded = !is_large_image;
+            
             // 重置缩放状态
             state.reset_zoom();
             
-            println!("✅ 图像加载成功：{}x{}", image_buf.w, image_buf.h);
+            // 更新图片列表
+            state.update_image_list();
+            
+            if is_large_image {
+                println!("⚡ 图像快速加载完成（拖拽，使用缩小版本）");
+            } else {
+                println!("✅ 图像加载成功：{}x{}", image_buf.w, image_buf.h);
+            }
             Ok(())
         }
         Err(e) => {
