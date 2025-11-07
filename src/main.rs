@@ -62,6 +62,8 @@ const MENU_BATCH_PROCESS: u32 = 1028; // 批量处理菜单
 const MENU_BATCH_RESIZE: u32 = 1029; // 批量缩图
 // 新增：WIA图像采集菜单项
 const MENU_WIA_IMPORT: u32 = 1032; // 导入(WIA支持)
+// 新增：拍摄信息面板菜单项
+const MENU_EXIF_PANEL: u32 = 1033; // 拍摄信息面板
 
 // 滑块控件常量
 const TBS_HORZ: u32 = 0x0000;
@@ -160,6 +162,26 @@ static mut IMAGE_STATE: Option<ImageState> = None;
 // 全局对话框状态
 #[allow(static_mut_refs)]
 static mut DIALOG_STATE: Option<DialogState> = None;
+
+// 全局主窗口句柄
+#[allow(static_mut_refs)]
+static mut MAIN_HWND: Option<HWND> = None;
+
+// EXIF面板相关全局变量
+#[allow(static_mut_refs)]
+static mut EXIF_PANEL_HWND: Option<HWND> = None; // EXIF面板窗口句柄
+#[allow(static_mut_refs)]
+static mut EXIF_PANEL_VISIBLE: bool = false; // EXIF面板是否可见
+
+// EXIF数据结构
+#[derive(Debug, Clone, Default)]
+struct ExifData {
+    camera_model: String,
+    aperture: String,      // f/4.0
+    shutter_speed: String, // 1/800
+    iso: String,           // ISO-200
+    focal_length: String,  // 110mm
+}
 
 struct ImageState {
     original_bgr: Option<core::Mat>,
@@ -345,6 +367,10 @@ impl ImageState {
         } else {
             println!("✅ 图像加载完成");
         }
+        
+        // 更新EXIF面板（如果打开）
+        unsafe { update_exif_panel_if_visible(); }
+        
         Ok(())
     }
     
@@ -417,6 +443,10 @@ impl ImageState {
         } else {
             println!("✅ 图像加载成功（备用方法）");
         }
+        
+        // 更新EXIF面板（如果打开）
+        unsafe { update_exif_panel_if_visible(); }
+        
         Ok(())
     }
     
@@ -971,6 +1001,13 @@ unsafe fn create_menu() -> HMENU {
     let extract_color_text = "读取色卡色块颜色(&E)";
     let extract_color_utf16: Vec<u16> = extract_color_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(process_menu, MF_STRING, MENU_EXTRACT_COLOR_BLOCKS as usize, extract_color_utf16.as_ptr());
+    
+    AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
+    
+    // 拍摄信息面板
+    let exif_panel_text = "拍摄信息面板(&X)";
+    let exif_panel_utf16: Vec<u16> = exif_panel_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(process_menu, MF_STRING, MENU_EXIF_PANEL as usize, exif_panel_utf16.as_ptr());
     
     AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
     
@@ -1672,6 +1709,9 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                     MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
                 }
             }
+        }
+        MENU_EXIF_PANEL => {
+            toggle_exif_panel(hwnd);
         }
         MENU_SAVE_FILE => {
             if let Some(ref mat) = state.current_mat {
@@ -3150,6 +3190,9 @@ fn main() {
         if hwnd.is_null() {
             panic!("Failed to create window");
         }
+        
+        // 保存主窗口句柄到全局变量
+        MAIN_HWND = Some(hwnd);
 
         // 启用拖拽文件接受
         DragAcceptFiles(hwnd, 1); // 1表示接受拖拽文件
@@ -4483,6 +4526,10 @@ fn load_image_from_path(file_path: &str) -> Result<()> {
             } else {
                 println!("✅ 图像加载成功：{}x{}", image_buf.w, image_buf.h);
             }
+            
+            // 更新EXIF面板（如果打开）
+            unsafe { update_exif_panel_if_visible(); }
+            
             Ok(())
         }
         Err(e) => {
@@ -5257,4 +5304,410 @@ fn process_single_image_for_batch_with_settings(
     }
 
     Ok(())
+}
+
+// ============== EXIF面板相关函数 ==============
+
+/// 从文件读取EXIF数据
+fn read_exif_from_file(file_path: &str) -> Result<ExifData> {
+    use std::fs::File;
+    use exif::{In, Reader, Tag};
+    
+    let file = File::open(file_path)
+        .context("无法打开图像文件")?;
+    let mut bufreader = std::io::BufReader::new(&file);
+    let exifreader = Reader::new();
+    let exif = exifreader.read_from_container(&mut bufreader)
+        .context("无法读取EXIF数据")?;
+    
+    let mut data = ExifData::default();
+    
+    // 读取相机型号
+    if let Some(field) = exif.get_field(Tag::Model, In::PRIMARY) {
+        data.camera_model = field.display_value().to_string().trim().to_string();
+    }
+    
+    // 读取光圈值 (FNumber)
+    if let Some(field) = exif.get_field(Tag::FNumber, In::PRIMARY) {
+        let value = field.display_value().to_string();
+        data.aperture = format!("f/{}", value);
+    }
+    
+    // 读取快门速度 (ExposureTime)
+    if let Some(field) = exif.get_field(Tag::ExposureTime, In::PRIMARY) {
+        data.shutter_speed = field.display_value().to_string();
+    }
+    
+    // 读取ISO
+    if let Some(field) = exif.get_field(Tag::PhotographicSensitivity, In::PRIMARY) {
+        data.iso = format!("ISO-{}", field.display_value());
+    }
+    
+    // 读取焦距
+    if let Some(field) = exif.get_field(Tag::FocalLength, In::PRIMARY) {
+        let value = field.display_value().to_string();
+        data.focal_length = format!("{} mm", value.replace(" mm", ""));
+    }
+    
+    Ok(data)
+}
+
+// EXIF面板控件ID
+const IDC_EXIF_CAMERA: i32 = 3001;
+const IDC_EXIF_APERTURE: i32 = 3002;
+const IDC_EXIF_SHUTTER: i32 = 3003;
+const IDC_EXIF_ISO: i32 = 3004;
+const IDC_EXIF_FOCAL: i32 = 3005;
+
+/// EXIF面板窗口过程
+unsafe extern "system" fn exif_panel_wnd_proc(
+    hwnd: HWND,
+    msg: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CREATE => {
+            // 创建Static控件显示EXIF信息
+            let font = CreateFontW(
+                22, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                "Microsoft YaHei\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+            );
+            
+            let mut y_pos = 15;
+            let label_width = 90;
+            let value_width = 240;
+            let height = 30;
+            let spacing = 38;
+            
+            // 相机型号标签和值
+            let camera_label_text = "相机型号:\0".encode_utf16().collect::<Vec<u16>>();
+            CreateWindowExW(
+                0,
+                "STATIC\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                camera_label_text.as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                10, y_pos, label_width, height,
+                hwnd,
+                0 as HMENU,
+                GetModuleHandleW(null_mut()),
+                null_mut(),
+            );
+            
+            let camera_value = CreateWindowExW(
+                0,
+                "STATIC\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                "-\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                100, y_pos, value_width, height,
+                hwnd,
+                IDC_EXIF_CAMERA as HMENU,
+                GetModuleHandleW(null_mut()),
+                null_mut(),
+            );
+            SendMessageW(camera_value, WM_SETFONT, font as WPARAM, 1);
+            y_pos += spacing;
+            
+            // 光圈值
+            let aperture_label_text = "光圈值:\0".encode_utf16().collect::<Vec<u16>>();
+            CreateWindowExW(
+                0,
+                "STATIC\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                aperture_label_text.as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                10, y_pos, label_width, height,
+                hwnd,
+                0 as HMENU,
+                GetModuleHandleW(null_mut()),
+                null_mut(),
+            );
+            
+            let aperture_value = CreateWindowExW(
+                0,
+                "STATIC\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                "-\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                100, y_pos, value_width, height,
+                hwnd,
+                IDC_EXIF_APERTURE as HMENU,
+                GetModuleHandleW(null_mut()),
+                null_mut(),
+            );
+            SendMessageW(aperture_value, WM_SETFONT, font as WPARAM, 1);
+            y_pos += spacing;
+            
+            // 曝光时间
+            let shutter_label_text = "曝光时间:\0".encode_utf16().collect::<Vec<u16>>();
+            CreateWindowExW(
+                0,
+                "STATIC\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                shutter_label_text.as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                10, y_pos, label_width, height,
+                hwnd,
+                0 as HMENU,
+                GetModuleHandleW(null_mut()),
+                null_mut(),
+            );
+            
+            let shutter_value = CreateWindowExW(
+                0,
+                "STATIC\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                "-\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                100, y_pos, value_width, height,
+                hwnd,
+                IDC_EXIF_SHUTTER as HMENU,
+                GetModuleHandleW(null_mut()),
+                null_mut(),
+            );
+            SendMessageW(shutter_value, WM_SETFONT, font as WPARAM, 1);
+            y_pos += spacing;
+            
+            // ISO速度
+            let iso_label_text = "ISO速度:\0".encode_utf16().collect::<Vec<u16>>();
+            CreateWindowExW(
+                0,
+                "STATIC\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                iso_label_text.as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                10, y_pos, label_width, height,
+                hwnd,
+                0 as HMENU,
+                GetModuleHandleW(null_mut()),
+                null_mut(),
+            );
+            
+            let iso_value = CreateWindowExW(
+                0,
+                "STATIC\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                "-\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                100, y_pos, value_width, height,
+                hwnd,
+                IDC_EXIF_ISO as HMENU,
+                GetModuleHandleW(null_mut()),
+                null_mut(),
+            );
+            SendMessageW(iso_value, WM_SETFONT, font as WPARAM, 1);
+            y_pos += spacing;
+            
+            // 焦距
+            let focal_label_text = "焦距:\0".encode_utf16().collect::<Vec<u16>>();
+            CreateWindowExW(
+                0,
+                "STATIC\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                focal_label_text.as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                10, y_pos, label_width, height,
+                hwnd,
+                0 as HMENU,
+                GetModuleHandleW(null_mut()),
+                null_mut(),
+            );
+            
+            let focal_value = CreateWindowExW(
+                0,
+                "STATIC\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                "-\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                100, y_pos, value_width, height,
+                hwnd,
+                IDC_EXIF_FOCAL as HMENU,
+                GetModuleHandleW(null_mut()),
+                null_mut(),
+            );
+            SendMessageW(focal_value, WM_SETFONT, font as WPARAM, 1);
+            
+            0
+        }
+        WM_CLOSE => {
+            // 隐藏窗口而不是销毁
+            ShowWindow(hwnd, SW_HIDE);
+            EXIF_PANEL_VISIBLE = false;
+            // 更新主窗口菜单的勾选状态
+            update_exif_menu_check();
+            0
+        }
+        WM_DESTROY => {
+            EXIF_PANEL_HWND = None;
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// 创建EXIF面板窗口
+unsafe fn create_exif_panel_window(main_hwnd: HWND) -> HWND {
+    // 注册窗口类
+    let class_name = "ExifPanelClass\0".encode_utf16().collect::<Vec<u16>>();
+    
+    let wc = WNDCLASSW {
+        style: 0,
+        lpfnWndProc: Some(exif_panel_wnd_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: GetModuleHandleW(null_mut()),
+        hIcon: null_mut(),
+        hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+        hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
+        lpszMenuName: null_mut(),
+        lpszClassName: class_name.as_ptr(),
+    };
+    
+    RegisterClassW(&wc);
+    
+    // 创建窗口
+    let window_title = "拍摄信息\0".encode_utf16().collect::<Vec<u16>>();
+    let panel_width = 360;
+    let panel_height = 250;
+    
+    // 获取主窗口位置
+    let mut main_rect: RECT = std::mem::zeroed();
+    GetWindowRect(main_hwnd, &mut main_rect);
+    
+    // 放在主窗口右侧
+    let x = main_rect.right + 10;
+    let y = main_rect.top;
+    
+    let hwnd = CreateWindowExW(
+        0,
+        class_name.as_ptr(),
+        window_title.as_ptr(),
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        x, y,
+        panel_width, panel_height,
+        main_hwnd,
+        null_mut(),
+        GetModuleHandleW(null_mut()),
+        null_mut(),
+    );
+    
+    hwnd
+}
+
+/// 更新EXIF面板内容
+unsafe fn update_exif_panel_content(panel_hwnd: HWND) {
+    let state = IMAGE_STATE.as_ref().unwrap();
+    if let Some(ref path) = state.current_file_path {
+        match read_exif_from_file(path) {
+            Ok(exif_data) => {
+                // 更新窗口标题显示文件名
+                let filename = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("未知");
+                let title = format!("拍摄信息 - {}\0", filename);
+                let title_utf16: Vec<u16> = title.encode_utf16().collect();
+                SetWindowTextW(panel_hwnd, title_utf16.as_ptr());
+                
+                // 更新各个Static控件的文本
+                let camera_text = if exif_data.camera_model.is_empty() {
+                    "-\0".to_string()
+                } else {
+                    format!("{}\0", exif_data.camera_model)
+                };
+                let camera_utf16: Vec<u16> = camera_text.encode_utf16().collect();
+                let camera_hwnd = GetDlgItem(panel_hwnd, IDC_EXIF_CAMERA);
+                SetWindowTextW(camera_hwnd, camera_utf16.as_ptr());
+                
+                let aperture_text = if exif_data.aperture.is_empty() {
+                    "-\0".to_string()
+                } else {
+                    format!("{}\0", exif_data.aperture)
+                };
+                let aperture_utf16: Vec<u16> = aperture_text.encode_utf16().collect();
+                let aperture_hwnd = GetDlgItem(panel_hwnd, IDC_EXIF_APERTURE);
+                SetWindowTextW(aperture_hwnd, aperture_utf16.as_ptr());
+                
+                let shutter_text = if exif_data.shutter_speed.is_empty() {
+                    "-\0".to_string()
+                } else {
+                    format!("{}\0", exif_data.shutter_speed)
+                };
+                let shutter_utf16: Vec<u16> = shutter_text.encode_utf16().collect();
+                let shutter_hwnd = GetDlgItem(panel_hwnd, IDC_EXIF_SHUTTER);
+                SetWindowTextW(shutter_hwnd, shutter_utf16.as_ptr());
+                
+                let iso_text = if exif_data.iso.is_empty() {
+                    "-\0".to_string()
+                } else {
+                    format!("{}\0", exif_data.iso)
+                };
+                let iso_utf16: Vec<u16> = iso_text.encode_utf16().collect();
+                let iso_hwnd = GetDlgItem(panel_hwnd, IDC_EXIF_ISO);
+                SetWindowTextW(iso_hwnd, iso_utf16.as_ptr());
+                
+                let focal_text = if exif_data.focal_length.is_empty() {
+                    "-\0".to_string()
+                } else {
+                    format!("{}\0", exif_data.focal_length)
+                };
+                let focal_utf16: Vec<u16> = focal_text.encode_utf16().collect();
+                let focal_hwnd = GetDlgItem(panel_hwnd, IDC_EXIF_FOCAL);
+                SetWindowTextW(focal_hwnd, focal_utf16.as_ptr());
+                
+                println!("✅ EXIF信息已更新");
+            }
+            Err(e) => {
+                // 显示"无EXIF数据"
+                println!("⚠️ 无法读取EXIF: {}", e);
+                let no_exif = "无EXIF数据\0".encode_utf16().collect::<Vec<u16>>();
+                let camera_hwnd = GetDlgItem(panel_hwnd, IDC_EXIF_CAMERA);
+                SetWindowTextW(camera_hwnd, no_exif.as_ptr());
+            }
+        }
+    }
+}
+
+/// 如果EXIF面板可见，则更新内容
+unsafe fn update_exif_panel_if_visible() {
+    if EXIF_PANEL_VISIBLE {
+        if let Some(panel_hwnd) = EXIF_PANEL_HWND {
+            update_exif_panel_content(panel_hwnd);
+        }
+    }
+}
+
+/// 切换EXIF面板显示/隐藏
+unsafe fn toggle_exif_panel(main_hwnd: HWND) {
+    if EXIF_PANEL_VISIBLE {
+        // 关闭面板
+        if let Some(panel_hwnd) = EXIF_PANEL_HWND {
+            ShowWindow(panel_hwnd, SW_HIDE);
+        }
+        EXIF_PANEL_VISIBLE = false;
+        println!("⏹️ EXIF面板已隐藏");
+    } else {
+        // 显示面板
+        if EXIF_PANEL_HWND.is_none() {
+            // 首次创建窗口
+            EXIF_PANEL_HWND = Some(create_exif_panel_window(main_hwnd));
+        }
+        
+        if let Some(panel_hwnd) = EXIF_PANEL_HWND {
+            // 更新EXIF数据
+            update_exif_panel_content(panel_hwnd);
+            ShowWindow(panel_hwnd, SW_SHOW);
+            SetForegroundWindow(panel_hwnd);
+        }
+        EXIF_PANEL_VISIBLE = true;
+        println!("▶️ EXIF面板已显示");
+    }
+    
+    // 更新菜单勾选状态
+    update_exif_menu_check();
+}
+
+/// 更新菜单的勾选状态
+unsafe fn update_exif_menu_check() {
+    if let Some(main_hwnd) = MAIN_HWND {
+        let menu = GetMenu(main_hwnd);
+        if !menu.is_null() {
+            let check_flag = if EXIF_PANEL_VISIBLE { MF_CHECKED } else { MF_UNCHECKED };
+            CheckMenuItem(menu, MENU_EXIF_PANEL, check_flag);
+        }
+    }
 }
