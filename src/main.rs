@@ -181,6 +181,7 @@ struct ExifData {
     shutter_speed: String, // 1/800
     iso: String,           // ISO-200
     focal_length: String,  // 110mm
+    color_space: String,   // sRGB / Adobe RGB
 }
 
 struct ImageState {
@@ -5349,6 +5350,17 @@ fn read_exif_from_file(file_path: &str) -> Result<ExifData> {
         data.focal_length = format!("{} mm", value.replace(" mm", ""));
     }
     
+    // 读取色彩空间
+    if let Some(field) = exif.get_field(Tag::ColorSpace, In::PRIMARY) {
+        let value = field.value.get_uint(0).unwrap_or(0);
+        data.color_space = match value {
+            1 => "sRGB".to_string(),
+            2 => "Adobe RGB".to_string(),
+            65535 => "未校准".to_string(),
+            _ => format!("未知({})", value),
+        };
+    }
+    
     Ok(data)
 }
 
@@ -5358,6 +5370,7 @@ const IDC_EXIF_APERTURE: i32 = 3002;
 const IDC_EXIF_SHUTTER: i32 = 3003;
 const IDC_EXIF_ISO: i32 = 3004;
 const IDC_EXIF_FOCAL: i32 = 3005;
+const IDC_EXIF_COLORSPACE: i32 = 3006;
 
 /// EXIF面板窗口过程
 unsafe extern "system" fn exif_panel_wnd_proc(
@@ -5520,6 +5533,34 @@ unsafe extern "system" fn exif_panel_wnd_proc(
                 null_mut(),
             );
             SendMessageW(focal_value, WM_SETFONT, font as WPARAM, 1);
+            y_pos += spacing;
+            
+            // 色彩空间
+            let colorspace_label_text = "色彩空间:\0".encode_utf16().collect::<Vec<u16>>();
+            CreateWindowExW(
+                0,
+                "STATIC\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                colorspace_label_text.as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                10, y_pos, label_width, height,
+                hwnd,
+                0 as HMENU,
+                GetModuleHandleW(null_mut()),
+                null_mut(),
+            );
+            
+            let colorspace_value = CreateWindowExW(
+                0,
+                "STATIC\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                "-\0".encode_utf16().collect::<Vec<u16>>().as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                100, y_pos, value_width, height,
+                hwnd,
+                IDC_EXIF_COLORSPACE as HMENU,
+                GetModuleHandleW(null_mut()),
+                null_mut(),
+            );
+            SendMessageW(colorspace_value, WM_SETFONT, font as WPARAM, 1);
             
             0
         }
@@ -5562,7 +5603,7 @@ unsafe fn create_exif_panel_window(main_hwnd: HWND) -> HWND {
     // 创建窗口
     let window_title = "拍摄信息\0".encode_utf16().collect::<Vec<u16>>();
     let panel_width = 360;
-    let panel_height = 250;
+    let panel_height = 290;
     
     // 获取主窗口位置
     let mut main_rect: RECT = std::mem::zeroed();
@@ -5648,6 +5689,16 @@ unsafe fn update_exif_panel_content(panel_hwnd: HWND) {
                 let focal_utf16: Vec<u16> = focal_text.encode_utf16().collect();
                 let focal_hwnd = GetDlgItem(panel_hwnd, IDC_EXIF_FOCAL);
                 SetWindowTextW(focal_hwnd, focal_utf16.as_ptr());
+                
+                // 更新色彩空间
+                let colorspace_text = if exif_data.color_space.is_empty() {
+                    "-\0".to_string()
+                } else {
+                    format!("{}\0", exif_data.color_space)
+                };
+                let colorspace_utf16: Vec<u16> = colorspace_text.encode_utf16().collect();
+                let colorspace_hwnd = GetDlgItem(panel_hwnd, IDC_EXIF_COLORSPACE);
+                SetWindowTextW(colorspace_hwnd, colorspace_utf16.as_ptr());
                 
                 println!("✅ EXIF信息已更新");
             }
