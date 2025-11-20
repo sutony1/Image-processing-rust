@@ -1270,12 +1270,34 @@ fn calculate_scaled_size_with_zoom_factor(state: &ImageState, zoom_factor: f32, 
 // 更新窗口标题，显示SAM模型状态
 unsafe fn update_window_title_with_sam_status(hwnd: HWND, state: &ImageState, sam_loaded: bool) {
     let base_title = if state.has_image() {
-        format!("图像查看器 - {}x{} - OpenCV处理", 
-            state.current_width, 
-            state.current_height
-        )
+        // 获取文件路径
+        if let Some(ref file_path) = state.current_file_path {
+            // 转换为绝对路径
+            let abs_path = match std::fs::canonicalize(file_path) {
+                Ok(path) => path.to_string_lossy().to_string(),
+                Err(_) => file_path.clone(), // 如果无法获取绝对路径，使用原路径
+            };
+            
+            // 去掉Windows长路径前缀 "\\?\"
+            let clean_path = if abs_path.starts_with("\\\\?\\") {
+                &abs_path[4..]
+            } else {
+                &abs_path
+            };
+            
+            format!("图像查看器 - {}x{} - {}", 
+                state.current_width, 
+                state.current_height,
+                clean_path
+            )
+        } else {
+            format!("图像查看器 - {}x{}", 
+                state.current_width, 
+                state.current_height
+            )
+        }
     } else {
-        "图像处理查看器 - OpenCV + Win32".to_string()
+        "图像查看器".to_string()
     };
     
     let full_title = if sam_loaded {
@@ -1291,12 +1313,34 @@ unsafe fn update_window_title_with_sam_status(hwnd: HWND, state: &ImageState, sa
 // 更新窗口标题，显示拉直模式状态
 unsafe fn update_window_title_with_straighten_mode(hwnd: HWND, state: &ImageState) {
     let base_title = if state.has_image() {
-        format!("图像查看器 - {}x{} - OpenCV处理", 
-            state.current_width, 
-            state.current_height
-        )
+        // 获取文件路径
+        if let Some(ref file_path) = state.current_file_path {
+            // 转换为绝对路径
+            let abs_path = match std::fs::canonicalize(file_path) {
+                Ok(path) => path.to_string_lossy().to_string(),
+                Err(_) => file_path.clone(), // 如果无法获取绝对路径，使用原路径
+            };
+            
+            // 去掉Windows长路径前缀 "\\?\"
+            let clean_path = if abs_path.starts_with("\\\\?\\") {
+                &abs_path[4..]
+            } else {
+                &abs_path
+            };
+            
+            format!("图像查看器 - {}x{} - {}", 
+                state.current_width, 
+                state.current_height,
+                clean_path
+            )
+        } else {
+            format!("图像查看器 - {}x{}", 
+                state.current_width, 
+                state.current_height
+            )
+        }
     } else {
-        "图像处理查看器 - OpenCV + Win32".to_string()
+        "图像查看器".to_string()
     };
     
     let sam_suffix = if state.sam_processor.as_ref().map_or(false, |sam| sam.is_encoded()) {
@@ -3170,7 +3214,7 @@ fn main() {
         let menu = create_menu();
         
         // 创建窗口
-        let window_title = "图像处理查看器 - OpenCV + Win32";
+        let window_title = "图像查看器";
         let window_title_utf16: Vec<u16> = window_title.encode_utf16().chain(std::iter::once(0)).collect();
 
         let hwnd = CreateWindowExW(
