@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 use std::ptr::null_mut;
 use winapi::um::winuser::{*, EnableWindow, SetForegroundWindow, LoadCursorW, IDC_ARROW, IDC_HAND, COLOR_WINDOW, CS_HREDRAW, CS_VREDRAW, UnregisterClassW, EnableMenuItem};
 
@@ -17,7 +19,6 @@ use anyhow::{Result, Context};
 mod ocv_bridge;
 mod cv_ops;
 mod sam_core;
-mod wia_scanner;
 
 // 菜单项ID常量
 const MENU_OPEN_FILE: u32 = 1000;
@@ -60,8 +61,6 @@ const MENU_STRAIGHTEN_HORIZONTAL: u32 = 1027; // 水平校正
 // 新增：批量处理菜单项
 const MENU_BATCH_PROCESS: u32 = 1028; // 批量处理菜单
 const MENU_BATCH_RESIZE: u32 = 1029; // 批量缩图
-// 新增：WIA图像采集菜单项
-const MENU_WIA_IMPORT: u32 = 1032; // 导入(WIA支持)
 // 新增：拍摄信息面板菜单项
 const MENU_EXIF_PANEL: u32 = 1033; // 拍摄信息面板
 
@@ -909,11 +908,6 @@ unsafe fn create_menu() -> HMENU {
     let open_file_utf16: Vec<u16> = open_file_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(file_menu, MF_STRING, MENU_OPEN_FILE as usize, open_file_utf16.as_ptr());
     
-    // 添加WIA导入菜单项
-    let wia_import_text = "导入(WIA支持)(&W)...";
-    let wia_import_utf16: Vec<u16> = wia_import_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(file_menu, MF_STRING, MENU_WIA_IMPORT as usize, wia_import_utf16.as_ptr());
-    
     AppendMenuW(file_menu, MF_SEPARATOR, 0, null_mut());
     
     let save_file_text = "保存文件(&S)...";
@@ -1406,6 +1400,104 @@ unsafe fn window_to_image_coords_with_zoom(hwnd: HWND, state: &ImageState, win_x
     Some((img_x.clamp(0, state.current_width-1), img_y.clamp(0, state.current_height-1)))
 }
 
+// 将窗口坐标映射到图像坐标；点在黑边外时钳到图像边缘，避免松手丢事件
+unsafe fn window_to_image_coords_clamped(hwnd: HWND, state: &ImageState, win_x: i32, win_y: i32) -> (i32, i32) {
+    if !state.has_image() {
+        return (0, 0);
+    }
+
+    let mut rect: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rect);
+    let window_width = rect.right - rect.left;
+    let window_height = rect.bottom - rect.top;
+    let (x0, y0, scaled_w, scaled_h) = calculate_scaled_size_with_zoom(state, window_width, window_height);
+    if scaled_w <= 0 || scaled_h <= 0 || state.current_width <= 0 || state.current_height <= 0 {
+        return (0, 0);
+    }
+
+    let rel_x = (win_x - x0).clamp(0, scaled_w - 1);
+    let rel_y = (win_y - y0).clamp(0, scaled_h - 1);
+    let img_x = (rel_x as i64 * state.current_width as i64 / scaled_w as i64) as i32;
+    let img_y = (rel_y as i64 * state.current_height as i64 / scaled_h as i64) as i32;
+    (img_x.clamp(0, state.current_width - 1), img_y.clamp(0, state.current_height - 1))
+}
+
+unsafe fn show_message(hwnd: HWND, title: &str, message: &str, flags: u32) {
+    let title_utf16: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let message_utf16: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+    MessageBoxW(hwnd, message_utf16.as_ptr(), title_utf16.as_ptr(), flags);
+}
+
+unsafe fn finish_sam_selection(hwnd: HWND, state: &mut ImageState) {
+    let (x1, y1, x2, y2) = match (state.select_start, state.select_end) {
+        (Some((sx, sy)), Some((ex, ey))) => (sx.min(ex), sy.min(ey), sx.max(ex), sy.max(ey)),
+        _ => return,
+    };
+
+    if x2 - x1 < 8 || y2 - y1 < 8 {
+        show_message(hwnd, "提示", "选框太小。请按住左键拖出一个能包住对象的方框，再松开。", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    if !state.sam_processor.as_ref().map(|sam| sam.is_encoded()).unwrap_or(false) {
+        state.selecting = false;
+        show_message(hwnd, "提示", "SAM 尚未编码当前图像。请先点菜单「SAM交互分割抠像」。", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    SetCursor(LoadCursorW(null_mut(), IDC_WAIT));
+    update_window_title_with_sam_status(hwnd, state, true);
+    let wait_title = {
+        let mut t = String::new();
+        if state.has_image() {
+            t = format!("图像查看器 - {}x{} - 正在分割，请稍候...", state.current_width, state.current_height);
+        }
+        t
+    };
+    if !wait_title.is_empty() {
+        let wait_utf16: Vec<u16> = wait_title.encode_utf16().chain(std::iter::once(0)).collect();
+        SetWindowTextW(hwnd, wait_utf16.as_ptr());
+    }
+
+    let decoded = state.sam_processor.as_ref().unwrap().decode_prompt(
+        x1 as f32, y1 as f32, x2 as f32, y2 as f32,
+    );
+
+    match decoded {
+        Ok((mask, mw, mh)) => {
+            let positive = mask.iter().filter(|&&v| v != 0).count();
+            state.set_current_mask(mask.clone(), mw as i32, mh as i32);
+            if positive == 0 {
+                update_window_title_with_sam_status(hwnd, state, true);
+                show_message(hwnd, "分割结果", "没有分割到对象。请把方框画得更贴对象外围后再试。", MB_OK | MB_ICONINFORMATION);
+            } else {
+                match overlay_mask_on_current(state, &mask, mw as i32, mh as i32) {
+                    Ok(()) => {
+                        state.selecting = false;
+                        state.select_start = None;
+                        state.select_end = None;
+                        if let Some(ref mut sam) = state.sam_processor {
+                            sam.reset();
+                        }
+                        update_window_title_with_sam_status(hwnd, state, false);
+                        show_message(hwnd, "分割完成", "已用绿色半透明遮罩标出对象。\n\n需要抠出来时，再点「SAM分割」→「抠图并显示」。", MB_OK | MB_ICONINFORMATION);
+                    }
+                    Err(e) => {
+                        update_window_title_with_sam_status(hwnd, state, true);
+                        show_message(hwnd, "叠加失败", &format!("分割已算出，但无法画到图上：\n{}", e), MB_OK | MB_ICONERROR);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            update_window_title_with_sam_status(hwnd, state, true);
+            show_message(hwnd, "分割失败", &format!("SAM分割失败：\n{}", e), MB_OK | MB_ICONERROR);
+        }
+    }
+
+    SetCursor(LoadCursorW(null_mut(), IDC_ARROW));
+}
+
 fn overlay_mask_on_current(state: &mut ImageState, mask: &[u8], mask_w: i32, mask_h: i32) -> Result<()> {
     use opencv::{imgproc, core as cvcore};
     let current = state.current_mat.as_ref().unwrap();
@@ -1701,57 +1793,6 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                         let title_utf16: Vec<u16> = "加载错误".encode_utf16().chain(std::iter::once(0)).collect();
                         MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
                     }
-                }
-            }
-        }
-        MENU_WIA_IMPORT => {
-            println!("🖨️ 用户点击了WIA导入菜单");
-            // Convert winapi HWND to windows crate HWND
-            let hwnd_windows = windows::Win32::Foundation::HWND(hwnd as *mut std::ffi::c_void);
-            match wia_scanner::acquire_image_from_scanner(hwnd_windows, None) {
-                Ok(scanned_file_path) => {
-                    println!("✅ 扫描完成，图像保存到: {}", scanned_file_path);
-                    
-                    // 自动加载扫描到的图像
-                    match state.load_image(&scanned_file_path) {
-                        Ok(()) => {
-                            println!("✅ 成功加载扫描图像");
-                            
-                            // 重置SAM处理器状态
-                            if let Some(ref mut sam) = state.sam_processor {
-                                sam.reset();
-                                println!("🔄 SAM处理器已重置");
-                            }
-                            
-                            // 更新窗口标题
-                            update_window_title_with_sam_status(hwnd, state, false);
-                            
-                            // 更新SAM菜单状态
-                            state.update_sam_menu_state(hwnd);
-                            
-                            InvalidateRect(hwnd, null_mut(), 1);
-                            
-                            // 显示成功提示
-                            let success_msg = format!("扫描完成！\n\n图像已保存到:\n{}\n\n图像已自动打开。", scanned_file_path);
-                            let success_msg_utf16: Vec<u16> = success_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                            let title_utf16: Vec<u16> = "扫描成功".encode_utf16().chain(std::iter::once(0)).collect();
-                            MessageBoxW(hwnd, success_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
-                        }
-                        Err(e) => {
-                            println!("❌ 加载扫描图像失败: {}", e);
-                            let error_msg = format!("扫描完成，但无法加载图像:\n{}\n\n错误信息: {}", scanned_file_path, e);
-                            let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                            let title_utf16: Vec<u16> = "加载错误".encode_utf16().chain(std::iter::once(0)).collect();
-                            MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("❌ WIA扫描失败: {}", e);
-                    let error_msg = format!("扫描操作失败:\n\n{}\n\n请检查:\n1. 扫描仪是否已连接并开机\n2. 扫描仪驱动是否已正确安装\n3. WIA服务是否正常运行", e);
-                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                    let title_utf16: Vec<u16> = "扫描失败".encode_utf16().chain(std::iter::once(0)).collect();
-                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
                 }
             }
         }
@@ -2554,6 +2595,15 @@ unsafe extern "system" fn window_proc(
                 let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
                 let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
                 
+                if state.selecting {
+                    SetCapture(hwnd);
+                    let (ix, iy) = window_to_image_coords_clamped(hwnd, state, mx, my);
+                    state.select_start = Some((ix, iy));
+                    state.select_end = Some((ix, iy));
+                    InvalidateRect(hwnd, null_mut(), 1);
+                    return 0;
+                }
+
                 // 检查是否点击了导航箭头
                 if state.mouse_in_left_arrow {
                     if let Err(e) = state.load_previous_image() {
@@ -2569,9 +2619,8 @@ unsafe extern "system" fn window_proc(
                     return 0;
                 }
                 
-                // 获取窗口尺寸
                 // 检查是否可以平移（不在其他模式）
-                if !state.selecting && !state.selection_mode && !state.straighten_mode && !state.manual_perspective_mode {
+                if !state.selection_mode && !state.straighten_mode && !state.manual_perspective_mode {
                     if state.can_pan() {
                         // 开始平移模式
                         state.start_pan(mx, my);
@@ -2580,13 +2629,9 @@ unsafe extern "system" fn window_proc(
                         return 0;
                     }
                 }
-                
+
                 if let Some((ix, iy)) = window_to_image_coords_with_zoom(hwnd, state, mx, my) {
-                    if state.selecting {
-                        // SAM交互分割模式
-                        state.select_start = Some((ix, iy));
-                        state.select_end = Some((ix, iy));
-                    } else if state.selection_mode {
+                    if state.selection_mode {
                         // 选框工具模式
                         state.selection_start = Some((ix, iy));
                         state.selection_end = Some((ix, iy));
@@ -2689,11 +2734,15 @@ unsafe extern "system" fn window_proc(
                         return 0;
                     }
                     
+                    if state.selecting {
+                        let (ix, iy) = window_to_image_coords_clamped(hwnd, state, mx, my);
+                        state.select_end = Some((ix, iy));
+                        InvalidateRect(hwnd, null_mut(), 0);
+                        return 0;
+                    }
+
                     if let Some((ix, iy)) = window_to_image_coords_with_zoom(hwnd, state, mx, my) {
-                        if state.selecting {
-                            // SAM交互分割模式
-                            state.select_end = Some((ix, iy));
-                        } else if state.selection_mode {
+                        if state.selection_mode {
                             // 选框工具模式
                             state.selection_end = Some((ix, iy));
                         } else if state.straighten_mode {
@@ -2719,46 +2768,18 @@ unsafe extern "system" fn window_proc(
                     InvalidateRect(hwnd, null_mut(), 1);
                     return 0;
                 }
+
+                if state.selecting {
+                    ReleaseCapture();
+                    let (ix, iy) = window_to_image_coords_clamped(hwnd, state, mx, my);
+                    state.select_end = Some((ix, iy));
+                    finish_sam_selection(hwnd, state);
+                    InvalidateRect(hwnd, null_mut(), 1);
+                    return 0;
+                }
                 
                 if let Some((ix, iy)) = window_to_image_coords_with_zoom(hwnd, state, mx, my) {
-                    if state.selecting {
-                        // SAM交互分割模式
-                        state.select_end = Some((ix, iy));
-                        state.selecting = false;
-                        if let (Some((x1,y1)), Some((x2,y2))) = (state.select_start, state.select_end) {
-                            if let Some(ref sam) = state.sam_processor {
-                                if sam.is_encoded() {
-                                    let (fx1, fy1) = (x1.min(x2) as f32, y1.min(y2) as f32);
-                                    let (fx2, fy2) = (x1.max(x2) as f32, y1.max(y2) as f32);
-                                    match sam.decode_prompt(fx1, fy1, fx2, fy2) {
-                                        Ok((mask, mw, mh)) => {
-                                            // 保存mask到状态中
-                                            state.set_current_mask(mask.clone(), mw as i32, mh as i32);
-                                            
-                                            if let Err(e) = overlay_mask_on_current(state, &mask, mw as i32, mh as i32) {
-                                                println!("❌ 叠加分割结果失败: {}", e);
-                                            } else {
-                                                InvalidateRect(hwnd, null_mut(), 1);
-                                            }
-                                            
-                                            // SAM分割成功后立即重置处理器状态，为下次分割做准备
-                                            if let Some(ref mut sam) = state.sam_processor {
-                                                sam.reset();
-                                                println!("🔄 SAM处理器已重置，下次分割时需要重新编码图像");
-                                            }
-                                        }
-                                        Err(e) => {
-                                            println!("❌ SAM分割失败: {}", e);
-                                            let msg = format!("SAM分割失败：\n{}", e);
-                                            let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                                            let title_utf16: Vec<u16> = "分割失败".encode_utf16().chain(std::iter::once(0)).collect();
-                                            MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if state.selection_mode {
+                    if state.selection_mode {
                         // 选框工具模式
                         state.selection_end = Some((ix, iy));
                         // 选框工具模式下不自动退出，保持选框显示
