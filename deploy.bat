@@ -25,6 +25,9 @@ if exist "config.yaml" copy "config.yaml" "%DEPLOY_DIR%\"
 echo 复制README文件...
 if exist "README.md" copy "README.md" "%DEPLOY_DIR%\"
 
+echo 复制帮助文件...
+if exist "help" xcopy /e /i /y "help" "%DEPLOY_DIR%\help\"
+
 echo.
 echo 部署完成！便携版程序位于: %DEPLOY_DIR%\
 echo 您可以将整个 %DEPLOY_DIR% 文件夹复制到任何Windows电脑上运行。

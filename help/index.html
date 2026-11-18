@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>图像查看器使用说明</title>
+  <style>
+    :root { --ink:#161616; --muted:#555; --line:#d9d9d4; --bg:#f6f5f1; --card:#fff; --accent:#1f4e3d; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:"Microsoft YaHei","PingFang SC",sans-serif; color:var(--ink); background:var(--bg); line-height:1.65; }
+    header { background:#111; color:#fff; padding:28px 20px 24px; }
+    header .wrap, main, footer { max-width: 920px; margin: 0 auto; }
+    h1 { margin:0 0 8px; font-size:28px; }
+    .sub { color:#cfcfcf; font-size:15px; }
+    nav { display:flex; flex-wrap:wrap; gap:10px 16px; padding:14px 20px; background:#fff; border-bottom:1px solid var(--line); position:sticky; top:0; }
+    nav a { color:var(--accent); text-decoration:none; font-size:14px; }
+    nav a:hover { text-decoration:underline; }
+    main { padding:24px 20px 64px; }
+    h2 { margin:36px 0 12px; font-size:22px; border-bottom:2px solid #111; padding-bottom:6px; }
+    h3 { margin:22px 0 8px; font-size:17px; }
+    p, li { font-size:15px; }
+    figure { margin:16px 0 8px; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+    figure img { display:block; width:100%; height:auto; }
+    figcaption { padding:8px 12px 12px; font-size:13px; color:var(--muted); }
+    .callout { background:#fff; border-left:4px solid #111; padding:12px 14px; margin:16px 0; }
+    table { border-collapse:collapse; width:100%; background:#fff; font-size:14px; }
+    th, td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+    th { background:#eee; }
+    ol.steps { padding-left:22px; }
+    ol.steps > li { margin:10px 0; }
+    kbd { font-family:Consolas,monospace; border:1px solid #bbb; border-bottom-width:2px; border-radius:4px; padding:0 5px; background:#fff; }
+    pre { background:#fff; border:1px solid var(--line); padding:12px 14px; overflow:auto; font-size:13px; }
+    footer { padding:20px; color:var(--muted); font-size:13px; }
+    @media print { nav { display:none; } figure { break-inside:avoid; } }
+  </style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>图像查看器使用说明</h1>
+    <div class="sub">img_view_cv · 以色卡测色为主线 · 例图 <code>.\help\images\photo-color-card.jpg</code></div>
+  </div>
+</header>
+<nav>
+  <a href="#start">这是什么</a>
+  <a href="#flow">完整流程</a>
+  <a href="#menu">透视矫正菜单</a>
+  <a href="#alt">已经拍正 / 手动四点</a>
+  <a href="#other">其它功能</a>
+  <a href="#cli">命令行 / 截图</a>
+  <a href="#trouble">常见问题</a>
+</nav>
+<main>
+
+<h2 id="start">这是什么程序</h2>
+<p>Windows 上的图像查看 / 处理工具。打开照片后可以缩放、平移、旋转。核心用途是把<strong>拍歪的色卡拉正，并读出 24 个色块的 RGB</strong>。</p>
+<p>下面整套截图都用同一张例图实地跑完：<code>.\help\images\photo-color-card.jpg</code>（桌上的 Datacolor 24 色卡，带透视）。窗口大小按约 <strong>1742×1451</strong> 截取。</p>
+<div class="callout">
+  <strong>初学者只记一件事：</strong>打开照片后点 <strong>透视矫正 → 色卡测色向导</strong>，按对话框往下走。不必先学 SAM、透视这些单步工具。
+</div>
+<figure>
+  <img src="images/workflow.png" alt="四步流程">
+  <figcaption>推荐顺序：打开照片 → 向导 → 框选（或已经拍正就直接读色）→ 拉正并读取 24 色。</figcaption>
+</figure>
+
+<h2 id="flow">用「色卡1.jpg」完整做一遍</h2>
+
+<h3>第 1 步：打开照片</h3>
+<p>「文件 → 打开文件」，选上面的路径；或把文件拖进窗口。标题栏会显示图像尺寸和文件路径。</p>
+<figure>
+  <img src="images/01_open.jpg" alt="打开色卡照片">
+  <figcaption>打开后。旧版界面截图。新版请从「透视矫正」进入色卡测色向导。</figcaption>
+</figure>
+
+<h3>第 2 步：框选出整张色卡</h3>
+<p>点 <strong>透视矫正 → 色卡测色向导</strong>。对这张周围还有桌子和腿的照片，问「这是拍歪的色卡照片吗？」时选 <strong>是</strong>。</p>
+<p>等 SAM 模型加载完成（第一次可能要几秒）。然后按住左键拖一个绿框，<strong>包住黑色色卡外框整张</strong>（含右上角 datacolor 字样），松开。不要只框几个色块。</p>
+<p>松开后标题可能显示「正在分割」。成功后背景变黑，只留下色卡，标题变成 <strong>色卡：已抠图，待拉正</strong>。</p>
+<figure>
+  <img src="images/02_sam_crop.jpg" alt="抠出色卡">
+  <figcaption>框选并抠图之后。桌子、鼠标垫、腿都去掉了，色卡还带着一点透视。</figcaption>
+</figure>
+<p>向导会问要不要自动拉正，选「确定」。也可以自己点菜单 <strong>2. 拉正色卡 (自动透视)</strong>。</p>
+
+<h3>第 3 步：拉成正视图</h3>
+<p>自动透视会找色卡四个角，把画面拉正。成功后标题变成 <strong>色卡：已拉正，待读色</strong>。四个边应接近矩形，色块成整齐的 4 列 × 6 行。</p>
+<figure>
+  <img src="images/03_perspective.jpg" alt="透视拉正后">
+  <figcaption>自动透视之后。若这一步失败，用「手动四点拉正色卡」，按左上 → 右上 → 右下 → 左下点色卡黑框四角。</figcaption>
+</figure>
+
+<h3>第 4 步：读取 24 色</h3>
+<p>向导问是否读取色块时选「确定」，或点 <strong>3. 读取色块颜色</strong>。先出现带编号的网格，再确定后出现色卡参考图：编号、十六进制、RGB。标题变成 <strong>色卡：已读取颜色</strong>。</p>
+<figure>
+  <img src="images/04_colors.jpg" alt="24色读取结果">
+  <figcaption>本例读出的 24 色（与 Datacolor SpyderCheckr 顺序一致）。中间结果还会写到程序目录 <code>debug_out\</code>。</figcaption>
+</figure>
+
+<p>本例实测读数：</p>
+<table>
+  <tr><th>#</th><th>HEX</th><th>RGB</th><th>#</th><th>HEX</th><th>RGB</th></tr>
+  <tr><td>1</td><td>#E4EBF3</td><td>228,235,243</td><td>2</td><td>#0099BF</td><td>0,153,191</td></tr>
+  <tr><td>3</td><td>#FA741F</td><td>250,116,31</td><td>4</td><td>#61CCC9</td><td>97,204,201</td></tr>
+  <tr><td>5</td><td>#C7D0D9</td><td>199,208,217</td><td>6</td><td>#D44FA6</td><td>212,79,166</td></tr>
+  <tr><td>7</td><td>#255AAC</td><td>37,90,172</td><td>8</td><td>#8390C4</td><td>131,144,196</td></tr>
+  <tr><td>9</td><td>#AAB4BE</td><td>170,180,190</td><td>10</td><td>#EFC731</td><td>239,199,49</td></tr>
+  <tr><td>11</td><td>#E1506D</td><td>225,80,109</td><td>12</td><td>#4A703F</td><td>74,112,63</td></tr>
+  <tr><td>13</td><td>#88969D</td><td>136,150,157</td><td>14</td><td>#D6223E</td><td>214,34,62</td></tr>
+  <tr><td>15</td><td>#56296C</td><td>86,41,108</td><td>16</td><td>#4C8AB0</td><td>76,138,176</td></tr>
+  <tr><td>17</td><td>#626F77</td><td>98,111,119</td><td>18</td><td>#23A567</td><td>35,165,103</td></tr>
+  <tr><td>19</td><td>#A6C55D</td><td>166,197,93</td><td>20</td><td>#CCA79D</td><td>204,167,157</td></tr>
+  <tr><td>21</td><td>#36434D</td><td>54,67,77</td><td>22</td><td>#0A2490</td><td>10,36,144</td></tr>
+  <tr><td>23</td><td>#FE9718</td><td>254,151,24</td><td>24</td><td>#744A3A</td><td>116,74,58</td></tr>
+</table>
+
+<h2 id="menu">「透视矫正」菜单</h2>
+<table>
+  <tr><th>菜单项</th><th>什么时候用</th></tr>
+  <tr><td>色卡测色向导</td><td>最常用。按当前进度弹对话框。</td></tr>
+  <tr><td>1. 框出色卡 (SAM抠图)</td><td>照片里色卡周围还有桌子、背景时先抠。</td></tr>
+  <tr><td>2. 拉正色卡 (自动透视)</td><td>抠完之后。没抠过是灰色。</td></tr>
+  <tr><td>手动四点拉正色卡</td><td>自动找不到四个角时用。</td></tr>
+  <tr><td>3. 读取色块颜色</td><td>已经拉正之后。未拉正是灰色。</td></tr>
+  <tr><td>恢复到打开时的原图</td><td>做错了，回到刚打开的那张。</td></tr>
+</table>
+<p>标题栏进度：<strong>未框选</strong> → <strong>已抠图，待拉正</strong> → <strong>已拉正，待读色</strong> → <strong>已读取颜色</strong>。</p>
+<p>熟手可以不走向导，按 1、2、3 自己点。没做上一步时后面的项是灰的，这是故意的。</p>
+
+<h2 id="alt">已经拍正，或只用手动四点</h2>
+<p>展平画作、扫描件等平面时，选「透视矫正 → 手动四点矫正」，依次点击物体的左上、右上、右下、左下。第四点完成后直接显示正视图。</p>
+<p><strong>图已经是铺满窗口的 4×6 正视色卡：</strong>向导里选「否」，直接读 24 色，跳过抠图和透视。</p>
+<p><strong>不想用 SAM：</strong>打开照片 →「透视矫正 → 手动四点拉正色卡」→ 依次点色卡四个角（左上、右上、右下、左下）。点错按 <kbd>Esc</kbd>。点完第四点会自动拉正，并询问是否读色。</p>
+
+<h2 id="other">其它常用操作</h2>
+<table>
+  <tr><th>操作</th><th>怎么做</th></tr>
+  <tr><td>打开 / 关闭</td><td>使用文件菜单，也可以拖入图片打开。</td></tr>
+  <tr><td>保存</td><td>用当前处理结果覆盖正在编辑的文件。</td></tr>
+  <tr><td>另存为</td><td>在可缩放的文件对话框里选位置和格式。保存成功后，后续「保存」写入新文件。</td></tr>
+  <tr><td>上一张 / 下一张</td><td>鼠标移到窗口左右边缘，点箭头</td></tr>
+  <tr><td>缩放</td><td>滚轮，以鼠标位置为中心</td></tr>
+  <tr><td>平移</td><td>在图上按住左键拖（不要处在框选/拉直/四点模式）</td></tr>
+  <tr><td>灰度、Canny、阈值、旋转、EXIF</td><td>「处理」菜单。测色不必先做这些</td></tr>
+  <tr><td>画线水平校正</td><td>「拉直」：先画直线，再水平校正</td></tr>
+  <tr><td>裁剪 / 涂抹</td><td>「选框工具」</td></tr>
+  <tr><td>批量缩图</td><td>「批量处理」</td></tr>
+  <tr><td>使用说明</td><td>「帮助 → 使用说明」（本页）</td></tr>
+</table>
+<p>要抠人、抠物体而不是走色卡流程，用顶栏「SAM分割」：交互分割抠像 → 拖框 → 再点「抠图并显示」。灰度图会禁用 SAM。模型文件 <code>vit_t_encoder.onnx</code>、<code>vit_t_decoder.onnx</code> 放在 exe 旁边。</p>
+
+<h2 id="cli">命令行 / 截图</h2>
+<p>没有 MCP。脚本和 AI 用 <code>--cli</code>。查看器会在本机 <code>127.0.0.1:17332</code> 听命令（不出网），这是给 CLI 用的，不是网站。</p>
+<p>本页四张步骤图就是用 CLI 实地跑完后截的。截图一次存两张：客户区画面，以及整个活动窗口（含标题栏和菜单）。</p>
+<pre><code>.\target\debug\img_view_cv.exe --cli status
+.\target\debug\img_view_cv.exe --cli open .\help\images\photo-color-card.jpg
+.\target\debug\img_view_cv.exe --cli screenshot
+.\target\debug\img_view_cv.exe --cli screenshot .
+</code></pre>
+<p>更完整的备忘：<code>docs/色卡向导与CLI.md</code>。</p>
+
+<h2 id="trouble">常见问题</h2>
+<table>
+  <tr><th>现象</th><th>原因与处理</th></tr>
+  <tr><td>「2. 拉正」是灰色</td><td>还没抠出色卡。先做第 1 步，或向导里对已经拍正的图选「否」。</td></tr>
+  <tr><td>「3. 读取色块」是灰色</td><td>还没拉正。先自动透视或手动四点。</td></tr>
+  <tr><td>拖完框没反应</td><td>绿框要够大，松开后等「正在分割」。框太小会提示重画。</td></tr>
+  <tr><td>自动透视失败</td><td>矩形不够完整。改用手动四点，点色卡黑框四角。</td></tr>
+  <tr><td>读色结果花了、格子对不齐</td><td>当前图还不是正视色卡。先抠再拉正。</td></tr>
+  <tr><td>中文文件名打不开 / 透视报空图</td><td>已按字节解码。仍失败就先抠图，对当前图继续，不必再读原路径。</td></tr>
+  <tr><td>SAM 找不到模型</td><td>把两个 <code>vit_t_*.onnx</code> 放到 exe 同一目录。</td></tr>
+</table>
+
+</main>
+<footer>
+  图像查看器（img_view_cv）使用说明 · 例图色卡1.jpg · 四步截图为实地处理结果 · 「帮助 → 使用说明」打开本页
+</footer>
+</body>
+</html>

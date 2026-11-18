@@ -1,6 +1,6 @@
 use opencv::prelude::*;
 use opencv::{core, imgproc, imgcodecs};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crate::ocv_bridge;
 
 /// 简化版的色卡检测，返回四个角点
@@ -391,6 +391,20 @@ fn order_points(pts: [core::Point2f; 4]) -> Result<[core::Point2f; 4]> {
     rect[2] = pts[max_sum_idx];  // 右下 (x+y最大)
     rect[3] = pts[min_diff_idx]; // 左下 (x-y最小)
     
+    let contour = core::Vector::from_slice(&rect);
+    if imgproc::is_contour_convex(&contour)? {
+        return Ok(rect);
+    }
+
+    // On strong tilts the sum/difference extrema can select the same point twice.
+    let center_x = pts.iter().map(|p| p.x).sum::<f32>() / 4.0;
+    let center_y = pts.iter().map(|p| p.y).sum::<f32>() / 4.0;
+    let angle = |p: &core::Point2f| (p.y - center_y).atan2(p.x - center_x);
+    rect = pts;
+    rect.sort_by(|a, b| angle(a).total_cmp(&angle(b)));
+    let start = rect.iter().position(|p| *p == pts[min_sum_idx])
+        .context("无法确定左上角")?;
+    rect.rotate_left(start);
     Ok(rect)
 }
 
@@ -398,11 +412,32 @@ fn order_points(pts: [core::Point2f; 4]) -> Result<[core::Point2f; 4]> {
 pub fn perspective_transform_from_points(bgr: &core::Mat, pts: [core::Point2f; 4]) -> Result<core::Mat> {
     let ordered_points = order_points(pts)?;
     
-    // 绘制排序后的角点
-    let mut ordered_points_img = bgr.clone();
-    draw_points(&mut ordered_points_img, &ordered_points)?;
-    ocv_bridge::save_debug_image(&ordered_points_img, "07_ordered_corners.png")?;
-    
+    let warped = warp_perspective_quad(bgr, ordered_points)?;
+    let mut annotated = bgr.try_clone()?;
+    if let Err(error) = draw_points(&mut annotated, &ordered_points)
+        .and_then(|_| ocv_bridge::save_debug_image(&annotated, "07_ordered_corners.png"))
+    {
+        println!("无法保存角点调试图: {}", error);
+    }
+    if let Err(error) = ocv_bridge::save_debug_image(&warped, "08_perspective_result.png") {
+        println!("无法保存透视调试图: {}", error);
+    }
+    Ok(warped)
+}
+
+/// Warp corners supplied clockwise from the top left.
+pub fn warp_perspective_quad(bgr: &core::Mat, ordered_points: [core::Point2f; 4]) -> Result<core::Mat> {
+    if ordered_points.iter().any(|p| {
+        !p.x.is_finite() || !p.y.is_finite() || p.x < 0.0 || p.y < 0.0
+            || p.x >= bgr.cols() as f32 || p.y >= bgr.rows() as f32
+    }) {
+        anyhow::bail!("四个角点必须位于图像内。");
+    }
+    let src_points = core::Vector::from_slice(&ordered_points);
+    if !imgproc::is_contour_convex(&src_points)? || imgproc::contour_area(&src_points, true)? < 4.0 {
+        anyhow::bail!("四点须围成顺时针四边形，角点不能重复或交叉。");
+    }
+
     // 计算输出图像的宽度和高度
     let tl = ordered_points[0];
     let tr = ordered_points[1]; 
@@ -418,12 +453,10 @@ pub fn perspective_transform_from_points(bgr: &core::Mat, pts: [core::Point2f; 4
     let max_height = height_a.max(height_b) as i32;
     
     // 设置输出图像的角点
-    let mut src_points = core::Vector::<core::Point2f>::new();
-    let mut dst_points = core::Vector::<core::Point2f>::new();
-    
-    for &pt in &ordered_points {
-        src_points.push(pt);
+    if max_width < 2 || max_height < 2 {
+        anyhow::bail!("所选四边形太窄。");
     }
+    let mut dst_points = core::Vector::<core::Point2f>::new();
     
     dst_points.push(core::Point2f::new(0.0, 0.0));
     dst_points.push(core::Point2f::new((max_width - 1) as f32, 0.0));
@@ -444,9 +477,7 @@ pub fn perspective_transform_from_points(bgr: &core::Mat, pts: [core::Point2f; 4
         core::BORDER_CONSTANT,
         core::Scalar::default()
     )?;
-    
-    ocv_bridge::save_debug_image(&warped, "08_perspective_result.png")?;
-    
+        
     Ok(warped)
 }
 

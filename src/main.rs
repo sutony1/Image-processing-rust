@@ -7,7 +7,7 @@ use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::wingdi::*;
 use winapi::um::commdlg::*;
 // 添加拖拽支持所需的导入
-use winapi::um::shellapi::{DragAcceptFiles, DragQueryFileW, DragFinish};
+use winapi::um::shellapi::{DragAcceptFiles, DragQueryFileW, DragFinish, ShellExecuteW};
 
 use winapi::shared::windef::*;
 use winapi::shared::minwindef::*;
@@ -19,6 +19,9 @@ use anyhow::{Result, Context};
 mod ocv_bridge;
 mod cv_ops;
 mod sam_core;
+mod ipc;
+mod cli;
+mod screenshot;
 
 // 菜单项ID常量
 const MENU_OPEN_FILE: u32 = 1000;
@@ -35,6 +38,7 @@ const MENU_EXTRACT_COLOR_BLOCKS: u32 = 1009;
 const MENU_TEMPLATE_MATCHING: u32 = 1010;
 const MENU_RESTORE: u32 = 1011;
 const MENU_SAVE_FILE: u32 = 1012;
+const MENU_SAVE_AS: u32 = 1032;
 // 添加SAM相关菜单项
 const MENU_SAM_INTERACTIVE: u32 = 1013; // 合并的SAM交互分割抠像菜单
 const MENU_SAM_EXTRACT_MASK: u32 = 1015; // 新增：抠图并显示
@@ -63,6 +67,24 @@ const MENU_BATCH_PROCESS: u32 = 1028; // 批量处理菜单
 const MENU_BATCH_RESIZE: u32 = 1029; // 批量缩图
 // 新增：拍摄信息面板菜单项
 const MENU_EXIF_PANEL: u32 = 1033; // 拍摄信息面板
+const MENU_COLOR_CARD_WIZARD: u32 = 1040; // 色卡测色向导
+const MENU_COLOR_CARD_SAM_CROP: u32 = 1041; // 1. 框出色卡
+const MENU_COLOR_CARD_MANUAL: u32 = 1042;
+const MENU_HELP_GUIDE: u32 = 1050; // 使用说明
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColorCardStage {
+    None,
+    Cropped,
+    Rectified,
+    ColorsRead,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManualPerspectiveMode {
+    General,
+    ColorCard,
+}
 
 // 滑块控件常量
 const TBS_HORZ: u32 = 0x0000;
@@ -208,8 +230,8 @@ struct ImageState {
     straighten_start: Option<(i32,i32)>, // 拉直线起始点
     straighten_end: Option<(i32,i32)>, // 拉直线结束点
     // 新增：手动透视变换相关状态
-    manual_perspective_mode: bool, // 是否处于手动透视变换模式
-    manual_perspective_points: Vec<(i32, i32)>, // 用户选择的四个角点
+    manual_perspective_mode: Option<ManualPerspectiveMode>,
+    manual_perspective_points: Vec<(i32, i32)>, // 显示图像上的四角
     // 新增：灰度图状态跟踪
     is_grayscale: bool, // 当前图像是否为灰度图或黑白图
     // 新增：平移相关状态
@@ -225,7 +247,10 @@ struct ImageState {
     // 新增：智能加载相关状态
     display_max_size: i32, // 显示用的最大尺寸限制（默认2048px）
     full_resolution_path: Option<String>, // 原图文件路径
+    current_is_original: bool,
     is_full_resolution_loaded: bool, // 当前original_bgr是否为完整分辨率
+    color_card_stage: ColorCardStage,
+    color_card_waiting_sam: bool, // 色卡向导/步骤1：框选后自动抠图
 }
 
 impl ImageState {
@@ -251,7 +276,7 @@ impl ImageState {
             straighten_mode: false, // 新增：拉直模式
             straighten_start: None, // 新增：拉直线起始点
             straighten_end: None, // 新增：拉直线结束点
-            manual_perspective_mode: false, // 新增：手动透视变换模式
+            manual_perspective_mode: None,
             manual_perspective_points: Vec::new(), // 新增：用户选择的四个角点
             is_grayscale: false, // 新增：灰度图状态
             pan_mode: false, // 新增：平移模式
@@ -264,7 +289,52 @@ impl ImageState {
             current_image_index: 0, // 新增：当前图片索引
             display_max_size: 2048, // 新增：显示最大尺寸
             full_resolution_path: None, // 新增：完整分辨率路径
+            current_is_original: false,
             is_full_resolution_loaded: false, // 新增：是否已加载完整分辨率
+            color_card_stage: ColorCardStage::None,
+            color_card_waiting_sam: false,
+        }
+    }
+
+    fn cancel_manual_perspective(&mut self) {
+        self.manual_perspective_mode = None;
+        self.manual_perspective_points.clear();
+    }
+
+    fn reset_color_card(&mut self) {
+        self.color_card_stage = ColorCardStage::None;
+        self.color_card_waiting_sam = false;
+    }
+
+    fn color_card_status_text(&self) -> &'static str {
+        match self.color_card_stage {
+            ColorCardStage::None => "色卡：未框选",
+            ColorCardStage::Cropped => "色卡：已抠图，待拉正",
+            ColorCardStage::Rectified => "色卡：已拉正，待读色",
+            ColorCardStage::ColorsRead => "色卡：已读取颜色",
+        }
+    }
+
+    fn update_color_card_menu_state(&self, hwnd: HWND) {
+        unsafe {
+            let menu = GetMenu(hwnd);
+            if menu.is_null() {
+                return;
+            }
+            let has_color = self.has_image() && !self.is_grayscale;
+            let has_img = self.has_image();
+            let can_auto = has_color && self.color_card_stage != ColorCardStage::None;
+            let can_extract = has_color && matches!(self.color_card_stage, ColorCardStage::Rectified | ColorCardStage::ColorsRead);
+            let en = |id: u32, ok: bool| {
+                EnableMenuItem(menu, id, MF_BYCOMMAND | if ok { MF_ENABLED } else { MF_GRAYED });
+            };
+            en(MENU_COLOR_CARD_WIZARD, has_color);
+            en(MENU_COLOR_CARD_SAM_CROP, has_color);
+            en(MENU_PERSPECTIVE_TRANSFORM, can_auto);
+            en(MENU_MANUAL_PERSPECTIVE, has_img);
+            en(MENU_COLOR_CARD_MANUAL, has_color);
+            en(MENU_EXTRACT_COLOR_BLOCKS, can_extract);
+            en(MENU_RESTORE, has_img);
         }
     }
     
@@ -302,19 +372,10 @@ impl ImageState {
             println!("🔍 检测到大图 ({}x{})，加载缩小版本以提升速度", img_w, img_h);
         }
         
-        // 尝试使用OpenCV读取图像为BGR格式
-        let mut bgr = match imgcodecs::imread(path, imgcodecs::IMREAD_COLOR) {
-            Ok(mat) => {
-                if mat.empty() {
-                    // 如果OpenCV返回空图像，尝试备用方法
-                    println!("OpenCV返回空图像，尝试备用方法");
-                    return self.load_image_fallback(path);
-                }
-                mat
-            }
+        let mut bgr = match Self::read_bgr_from_path(path) {
+            Ok(mat) => mat,
             Err(e) => {
-                // 如果OpenCV读取失败，尝试使用标准库读取然后转换
-                println!("OpenCV直接读取失败: {}, 尝试备用方法", e);
+                println!("读取图像失败: {}, 尝试备用方法", e);
                 return self.load_image_fallback(path);
             }
         };
@@ -351,13 +412,16 @@ impl ImageState {
         
         // 更新智能加载状态
         self.full_resolution_path = Some(path.to_string());
+        self.current_is_original = true;
         self.is_full_resolution_loaded = !is_large_image;
         
         // 重置缩放状态
         self.reset_zoom();
         
         // 重置选框工具状态
+        self.cancel_manual_perspective();
         self.reset_selection_tools();
+        self.reset_color_card();
         
         // 更新图片列表
         self.update_image_list();
@@ -374,21 +438,30 @@ impl ImageState {
         Ok(())
     }
     
+    fn read_bgr_from_path(path: &str) -> Result<core::Mat> {
+        // OpenCV imread 在 Windows 上无法打开含中文等非 ASCII 的路径，会得到空 Mat。
+        // 先试 imread，失败则按字节读入再用 imdecode。
+        match imgcodecs::imread(path, imgcodecs::IMREAD_COLOR) {
+            Ok(mat) if !mat.empty() => return Ok(mat),
+            Ok(_) => println!("OpenCV imread 返回空图像，改用内存解码: {}", path),
+            Err(e) => println!("OpenCV imread 失败: {}，改用内存解码: {}", e, path),
+        }
+
+        let image_data = std::fs::read(path)
+            .with_context(|| format!("无法读取图像文件: {}", path))?;
+        let data_vec = opencv::core::Vector::from_slice(&image_data);
+        let mat = imgcodecs::imdecode(&data_vec, imgcodecs::IMREAD_COLOR)
+            .context("无法解码图像数据")?;
+        if mat.empty() {
+            return Err(anyhow::anyhow!("解码后的图像为空，可能是不支持的格式: {}", path));
+        }
+        Ok(mat)
+    }
+
     fn load_image_fallback(&mut self, path: &str) -> Result<()> {
         println!("使用备用方法加载图像...");
         
-        // 使用标准库读取文件到内存
-        let image_data = std::fs::read(path)
-            .context("无法读取图像文件到内存")?;
-        
-        // 使用OpenCV从内存数据解码图像
-        let data_vec = opencv::core::Vector::from_slice(&image_data);
-        let mut bgr = imgcodecs::imdecode(&data_vec, imgcodecs::IMREAD_COLOR)
-            .context("无法解码图像数据")?;
-        
-        if bgr.empty() {
-            return Err(anyhow::anyhow!("解码后的图像为空，可能是不支持的格式"));
-        }
+        let mut bgr = Self::read_bgr_from_path(path)?;
         
         let img_w = bgr.cols() as u32;
         let img_h = bgr.rows() as u32;
@@ -427,13 +500,16 @@ impl ImageState {
         
         // 更新智能加载状态
         self.full_resolution_path = Some(path.to_string());
+        self.current_is_original = true;
         self.is_full_resolution_loaded = !is_large_image;
         
         // 重置缩放状态
         self.reset_zoom();
         
         // 重置选框工具状态
+        self.cancel_manual_perspective();
         self.reset_selection_tools();
+        self.reset_color_card();
         
         // 更新图片列表
         self.update_image_list();
@@ -453,6 +529,7 @@ impl ImageState {
     fn update_display_from_mat(&mut self, mat: &core::Mat) -> Result<()> {
         let image_buf = ocv_bridge::mat_to_bgra(mat)?;
         self.current_mat = Some(mat.try_clone()?);
+        self.current_is_original = false;
         self.display_pixels = image_buf.pixels;
         self.current_width = image_buf.w;
         self.current_height = image_buf.h;
@@ -477,19 +554,15 @@ impl ImageState {
         
         println!("⏳ 加载完整分辨率图像: {}", path);
         
-        // 加载完整分辨率图像
-        let full_bgr = imgcodecs::imread(&path, imgcodecs::IMREAD_COLOR)
+        let full_bgr = Self::read_bgr_from_path(&path)
             .context("无法读取完整分辨率图像")?;
-        
-        if full_bgr.empty() {
-            return Err(anyhow::anyhow!("加载完整分辨率失败：图像为空"));
-        }
         
         println!("✅ 完整分辨率加载完成: {}x{}", full_bgr.cols(), full_bgr.rows());
         
         // 更新状态
         self.original_bgr = Some(full_bgr.try_clone()?);
         self.current_mat = Some(full_bgr);
+        self.current_is_original = true;
         self.is_full_resolution_loaded = true;
         
         Ok(())
@@ -690,17 +763,14 @@ impl ImageState {
     fn update_sam_menu_state(&self, hwnd: HWND) {
         unsafe {
             if self.is_grayscale {
-                // 如果是灰度图，禁用SAM菜单项
                 EnableMenuItem(GetMenu(hwnd), MENU_SAM_INTERACTIVE as u32, MF_BYCOMMAND | MF_GRAYED);
                 EnableMenuItem(GetMenu(hwnd), MENU_SAM_EXTRACT_MASK as u32, MF_BYCOMMAND | MF_GRAYED);
-                println!("⚠️ SAM菜单已禁用 - 当前图像为灰度图/黑白图");
             } else {
-                // 如果是彩色图，启用SAM菜单项
                 EnableMenuItem(GetMenu(hwnd), MENU_SAM_INTERACTIVE as u32, MF_BYCOMMAND | MF_ENABLED);
                 EnableMenuItem(GetMenu(hwnd), MENU_SAM_EXTRACT_MASK as u32, MF_BYCOMMAND | MF_ENABLED);
-                println!("✅ SAM菜单已启用 - 当前图像为彩色图");
             }
         }
+        self.update_color_card_menu_state(hwnd);
     }
 
     // 判断是否可以平移图像
@@ -761,6 +831,8 @@ impl ImageState {
     fn close_current_file(&mut self) {
         self.original_bgr = None;
         self.current_mat = None;
+        self.current_is_original = false;
+        self.cancel_manual_perspective();
         self.display_pixels.clear();
         self.current_width = 0;
         self.current_height = 0;
@@ -783,6 +855,7 @@ impl ImageState {
         self.full_resolution_path = None;
         self.is_full_resolution_loaded = false;
         self.last_pan_offset = (0.0, 0.0);
+        self.reset_color_card();
         self.reset_zoom();
         println!("✅ 当前文件已关闭，状态已重置");
     }
@@ -886,16 +959,74 @@ fn save_mat_with_unicode_path(mat: &core::Mat, path: &str) -> Result<String> {
         path_buf.set_extension(file_ext);
     }
 
-    // 使用OpenCV编码到内存
-    let mut buf = core::Vector::<u8>::new();
-    imgcodecs::imencode(encode_ext, mat, &mut buf, &core::Vector::new())
-        .context("OpenCV 内存编码失败")?;
+    save_mat_at_path(mat, &path_buf, encode_ext)?;
+    Ok(path_buf.to_string_lossy().into_owned())
+}
 
-    // 通过Rust文件API写入，确保Unicode路径正确
-    std::fs::write(&path_buf, buf.to_vec())
-        .with_context(|| format!("写入文件失败: {}", path_buf.display()))?;
+fn save_mat_at_path(mat: &core::Mat, path: &std::path::Path, encode_ext: &str) -> Result<()> {
+    use std::io::{ErrorKind, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    Ok(path_buf.to_string_lossy().to_string())
+    let mut bytes = core::Vector::<u8>::new();
+    if !imgcodecs::imencode(encode_ext, mat, &mut bytes, &core::Vector::new())
+        .context("无法编码此格式，请使用「另存为…」选择其他格式")?
+    {
+        anyhow::bail!("图像编码失败。");
+    }
+
+    // Stage on the same filesystem so a write failure cannot truncate the existing image.
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let (temp, mut file) = loop {
+        let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temp = target.with_file_name(format!(".img-view-{}-{}.tmp", std::process::id(), seq));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("无法在目标目录创建临时文件"),
+        }
+    };
+    let written = file.write_all(bytes.as_slice()).and_then(|_| file.sync_all());
+    drop(file);
+    let result = written.and_then(|_| std::fs::rename(&temp, &target));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.with_context(|| format!("无法保存到 {}", path.display()))
+}
+
+fn save_current_document(state: &mut ImageState, path: &std::path::Path) -> Result<()> {
+    let current = state.current_mat.as_ref().context("请先打开一张图像。")?;
+    let extension = path.extension().and_then(|ext| ext.to_str())
+        .context("文件缺少扩展名，请使用「另存为…」选择格式")?;
+    let original_path = state.full_resolution_path.as_deref();
+    let overwrites_preview_source = !state.current_is_original && !state.is_full_resolution_loaded
+        && original_path.is_some_and(|original| {
+            let original = std::path::Path::new(original);
+            if original == path {
+                return true;
+            }
+            matches!((original.canonicalize(), path.canonicalize()), (Ok(a), Ok(b)) if a == b)
+        });
+
+    let full_original = if !state.is_full_resolution_loaded
+        && (state.current_is_original || overwrites_preview_source)
+    {
+        original_path.map(ImageState::read_bgr_from_path).transpose()?
+    } else {
+        None
+    };
+    let image = if state.current_is_original {
+        full_original.as_ref().unwrap_or(current)
+    } else {
+        current
+    };
+    save_mat_at_path(image, path, &format!(".{}", extension.to_ascii_lowercase()))?;
+    if overwrites_preview_source {
+        state.original_bgr = full_original;
+        state.is_full_resolution_loaded = true;
+    }
+    Ok(())
 }
 
 // 创建菜单
@@ -910,9 +1041,11 @@ unsafe fn create_menu() -> HMENU {
     
     AppendMenuW(file_menu, MF_SEPARATOR, 0, null_mut());
     
-    let save_file_text = "保存文件(&S)...";
+    let save_file_text = "保存(&S)";
     let save_file_utf16: Vec<u16> = save_file_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(file_menu, MF_STRING, MENU_SAVE_FILE as usize, save_file_utf16.as_ptr());
+    let save_as_utf16: Vec<u16> = "另存为(&A)…".encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(file_menu, MF_STRING, MENU_SAVE_AS as usize, save_as_utf16.as_ptr());
     
     // 添加关闭当前文件菜单项
     let close_file_text = "关闭当前文件(&C)";
@@ -971,34 +1104,6 @@ unsafe fn create_menu() -> HMENU {
     
     AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
     
-    // 轮廓检测 - 暂时隐藏
-    // let contours_text = "轮廓检测(&F)";
-    // let contours_utf16: Vec<u16> = contours_text.encode_utf16().chain(std::iter::once(0)).collect();
-    // AppendMenuW(process_menu, MF_STRING, MENU_FIND_CONTOURS as usize, contours_utf16.as_ptr());
-    
-            // 透视变换
-        let perspective_text = "自动透视变换(&P)";
-        let perspective_utf16: Vec<u16> = perspective_text.encode_utf16().chain(std::iter::once(0)).collect();
-        AppendMenuW(process_menu, MF_STRING, MENU_PERSPECTIVE_TRANSFORM as usize, perspective_utf16.as_ptr());
-    
-    // 手动透视变换
-    let manual_perspective_text = "手动透视变换(&M)";
-    let manual_perspective_utf16: Vec<u16> = manual_perspective_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(process_menu, MF_STRING, MENU_MANUAL_PERSPECTIVE as usize, manual_perspective_utf16.as_ptr());
-    
-    AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
-    
-    // 色卡分析 - 暂时隐藏模板匹配
-    // let template_match_text = "模板匹配定位色卡(&T)";
-    // let template_match_utf16: Vec<u16> = template_match_text.encode_utf16().chain(std::iter::once(0)).collect();
-    // AppendMenuW(process_menu, MF_STRING, MENU_TEMPLATE_MATCHING as usize, template_match_utf16.as_ptr());
-    
-    let extract_color_text = "读取色卡色块颜色(&E)";
-    let extract_color_utf16: Vec<u16> = extract_color_text.encode_utf16().chain(std::iter::once(0)).collect();
-    AppendMenuW(process_menu, MF_STRING, MENU_EXTRACT_COLOR_BLOCKS as usize, extract_color_utf16.as_ptr());
-    
-    AppendMenuW(process_menu, MF_SEPARATOR, 0, null_mut());
-    
     // 拍摄信息面板
     let exif_panel_text = "拍摄信息面板(&X)";
     let exif_panel_utf16: Vec<u16> = exif_panel_text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1043,9 +1148,37 @@ unsafe fn create_menu() -> HMENU {
     AppendMenuW(process_menu, MF_POPUP, rotation_menu as usize, rotate_utf16.as_ptr());
     
     // 添加菜单到菜单栏
+    let perspective_menu = CreatePopupMenu();
+    let manual_text: Vec<u16> = "手动四点矫正(&M)".encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(perspective_menu, MF_STRING, MENU_MANUAL_PERSPECTIVE as usize, manual_text.as_ptr());
+    AppendMenuW(perspective_menu, MF_SEPARATOR, 0, null_mut());
+    let wizard_text = "色卡测色向导(&W)...";
+    let wizard_utf16: Vec<u16> = wizard_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(perspective_menu, MF_STRING, MENU_COLOR_CARD_WIZARD as usize, wizard_utf16.as_ptr());
+    AppendMenuW(perspective_menu, MF_SEPARATOR, 0, null_mut());
+    let step1_text = "1. 框出色卡 (SAM抠图)(&1)";
+    let step1_utf16: Vec<u16> = step1_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(perspective_menu, MF_STRING, MENU_COLOR_CARD_SAM_CROP as usize, step1_utf16.as_ptr());
+    let step2_text = "2. 拉正色卡 (自动透视)(&2)";
+    let step2_utf16: Vec<u16> = step2_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(perspective_menu, MF_STRING, MENU_PERSPECTIVE_TRANSFORM as usize, step2_utf16.as_ptr());
+    let step2b_text = "    手动四点拉正色卡(&3)";
+    let step2b_utf16: Vec<u16> = step2b_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(perspective_menu, MF_STRING, MENU_COLOR_CARD_MANUAL as usize, step2b_utf16.as_ptr());
+    let step3_text = "3. 读取色块颜色(&4)";
+    let step3_utf16: Vec<u16> = step3_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(perspective_menu, MF_STRING, MENU_EXTRACT_COLOR_BLOCKS as usize, step3_utf16.as_ptr());
+    AppendMenuW(perspective_menu, MF_SEPARATOR, 0, null_mut());
+    let card_restore_text = "恢复到打开时的原图(&O)";
+    let card_restore_utf16: Vec<u16> = card_restore_text.encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(perspective_menu, MF_STRING, MENU_RESTORE as usize, card_restore_utf16.as_ptr());
+
     let file_text = "文件(&F)";
     let file_utf16: Vec<u16> = file_text.encode_utf16().chain(std::iter::once(0)).collect();
     AppendMenuW(menu_bar, MF_POPUP, file_menu as usize, file_utf16.as_ptr());
+
+    let perspective_text: Vec<u16> = "透视矫正(&C)".encode_utf16().chain(std::iter::once(0)).collect();
+    AppendMenuW(menu_bar, MF_POPUP, perspective_menu as usize, perspective_text.as_ptr());
     
     let process_text = "处理(&P)";
     let process_utf16: Vec<u16> = process_text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1107,6 +1240,14 @@ unsafe fn create_menu() -> HMENU {
         let batch_text = "批量处理(&B)";
         let batch_text_utf16: Vec<u16> = batch_text.encode_utf16().chain(std::iter::once(0)).collect();
         AppendMenuW(menu_bar, MF_POPUP, batch_menu as usize, batch_text_utf16.as_ptr());
+
+        let help_menu = CreatePopupMenu();
+        let help_guide_text = "使用说明(&H)...";
+        let help_guide_utf16: Vec<u16> = help_guide_text.encode_utf16().chain(std::iter::once(0)).collect();
+        AppendMenuW(help_menu, MF_STRING, MENU_HELP_GUIDE as usize, help_guide_utf16.as_ptr());
+        let help_text = "帮助(&H)";
+        let help_utf16: Vec<u16> = help_text.encode_utf16().chain(std::iter::once(0)).collect();
+        AppendMenuW(menu_bar, MF_POPUP, help_menu as usize, help_utf16.as_ptr());
         
         menu_bar
 }
@@ -1154,47 +1295,98 @@ unsafe fn show_open_file_dialog(hwnd: HWND) -> Option<String> {
     }
 }
 
-// 显示文件保存对话框
-unsafe fn show_save_file_dialog(hwnd: HWND) -> Option<String> {
-    let mut file_name = [0u16; 260]; // MAX_PATH
-    let filter = "PNG 文件\0*.png\0JPEG 文件\0*.jpg;*.jpeg\0BMP 文件\0*.bmp\0TIFF 文件\0*.tiff\0所有文件\0*.*\0\0";
-    let filter_utf16: Vec<u16> = filter.encode_utf16().collect();
-    let title_utf16: Vec<u16> = "选择保存位置\0".encode_utf16().collect();
-    let def_ext_utf16: Vec<u16> = "png\0".encode_utf16().collect();
-    
-    let mut ofn = OPENFILENAMEW {
-        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
-        hwndOwner: hwnd,
-        hInstance: null_mut(),
-        lpstrFilter: filter_utf16.as_ptr(),
-        lpstrCustomFilter: null_mut(),
-        nMaxCustFilter: 0,
-        nFilterIndex: 1,
-        lpstrFile: file_name.as_mut_ptr(),
-        nMaxFile: file_name.len() as u32,
-        lpstrFileTitle: null_mut(),
-        nMaxFileTitle: 0,
-        lpstrInitialDir: null_mut(),
-        lpstrTitle: title_utf16.as_ptr(),
-        Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST,
-        nFileOffset: 0,
-        nFileExtension: 0,
-        lpstrDefExt: def_ext_utf16.as_ptr(),
-        lCustData: 0,
-        lpfnHook: None,
-        lpTemplateName: null_mut(),
-        pvReserved: null_mut(),
-        dwReserved: 0,
-        FlagsEx: 0,
-    };
-    
-    if GetSaveFileNameW(&mut ofn) != 0 {
-        let len = file_name.iter().position(|&c| c == 0).unwrap_or(file_name.len());
-        let path = String::from_utf16_lossy(&file_name[..len]);
-        Some(path)
-    } else {
-        None
+// Keep the Explorer-style dialog resizable, with a normal window size at startup.
+unsafe extern "system" fn size_save_as_dialog(
+    hook: HWND, message: UINT, wparam: WPARAM, lparam: LPARAM,
+) -> usize {
+    const RESIZE_TIMER: usize = 1;
+    if message == WM_INITDIALOG || (message == WM_NOTIFY && lparam != 0
+        && (*(lparam as *const OFNOTIFYW)).hdr.code == CDN_INITDONE)
+    {
+        // The common dialog restores its remembered placement after initializing its controls.
+        SetTimer(hook, RESIZE_TIMER, 80, None);
+        return 0;
     }
+    if message != WM_TIMER || wparam != RESIZE_TIMER {
+        return 0;
+    }
+    KillTimer(hook, RESIZE_TIMER);
+    let dialog = GetParent(hook);
+    let monitor = MonitorFromWindow(dialog, MONITOR_DEFAULTTONEAREST);
+    let mut info: MONITORINFO = std::mem::zeroed();
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(monitor, &mut info) != 0 {
+        let work = info.rcWork;
+        let work_width = work.right - work.left;
+        let work_height = work.bottom - work.top;
+        let dpi = GetDpiForWindow(dialog).max(96) as i32;
+        let width = (760 * dpi / 96).min(work_width * 9 / 10);
+        let height = (540 * dpi / 96).min(work_height * 9 / 10);
+        if IsZoomed(dialog) != 0 {
+            ShowWindow(dialog, SW_RESTORE);
+        }
+        SetWindowPos(dialog, null_mut(), work.left + (work_width - width) / 2,
+            work.top + (work_height - height) / 2, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    0
+}
+
+unsafe fn show_save_file_dialog(hwnd: HWND, current_path: Option<&str>) -> Result<Option<std::path::PathBuf>> {
+    let current = current_path.map(std::path::Path::new);
+    let mut file_name = vec![0u16; 32768];
+    let stem = current.and_then(|path| path.file_stem()).and_then(|stem| stem.to_str()).unwrap_or("图像");
+    // Prefill a lossless copy name and start next to the active document.
+    for (cell, value) in file_name.iter_mut().take(32767).zip(format!("{}-副本", stem).encode_utf16()) {
+        *cell = value;
+    }
+    let initial_dir: Option<Vec<u16>> = current.and_then(|p| p.parent())
+        .and_then(|p| p.to_str()).filter(|p| !p.is_empty())
+        .map(|p| p.encode_utf16().chain(std::iter::once(0)).collect());
+    let filter: Vec<u16> =
+        "PNG 文件\0*.png\0JPEG 文件\0*.jpg;*.jpeg\0BMP 文件\0*.bmp\0TIFF 文件\0*.tif;*.tiff\0\0"
+        .encode_utf16().collect();
+    let title: Vec<u16> = "另存为\0".encode_utf16().collect();
+    let default_extension: Vec<u16> = "png\0".encode_utf16().collect();
+    let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = file_name.as_mut_ptr();
+    ofn.nMaxFile = file_name.len() as u32;
+    ofn.lpstrInitialDir = initial_dir.as_ref().map_or(null_mut(), |dir| dir.as_ptr());
+    ofn.lpstrTitle = title.as_ptr();
+    ofn.lpstrDefExt = default_extension.as_ptr();
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR
+        | OFN_EXPLORER | OFN_ENABLESIZING | OFN_ENABLEHOOK;
+    ofn.lpfnHook = Some(size_save_as_dialog);
+    if GetSaveFileNameW(&mut ofn) != 0 {
+        let end = file_name.iter().position(|&c| c == 0).unwrap_or(file_name.len());
+        return Ok(Some(std::path::PathBuf::from(String::from_utf16_lossy(&file_name[..end]))));
+    }
+    let error = CommDlgExtendedError();
+    if error != 0 {
+        anyhow::bail!("无法打开另存为对话框（错误 0x{:X}）。", error);
+    }
+    Ok(None)
+}
+
+unsafe fn save_from_menu(hwnd: HWND, state: &mut ImageState, save_as: bool) -> Result<()> {
+    if state.current_mat.is_none() {
+        anyhow::bail!("请先打开一张图像。");
+    }
+    if !save_as {
+        let path = state.current_file_path.clone().context("请先使用「另存为…」指定文件名。")?;
+        return save_current_document(state, std::path::Path::new(&path));
+    }
+    if let Some(path) = show_save_file_dialog(hwnd, state.current_file_path.as_deref())? {
+        save_current_document(state, &path)?;
+        state.current_file_path = Some(path.to_string_lossy().into_owned());
+        state.update_image_list();
+        refresh_window_title(hwnd, state);
+        update_exif_panel_if_visible();
+    }
+    Ok(())
 }
 
 // 显示带有"下一步"按钮的对话框
@@ -1261,47 +1453,51 @@ fn calculate_scaled_size_with_zoom_factor(state: &ImageState, zoom_factor: f32, 
     (final_x, final_y, zoomed_w, zoomed_h)
 }
 
-// 更新窗口标题，显示SAM模型状态
-unsafe fn update_window_title_with_sam_status(hwnd: HWND, state: &ImageState, sam_loaded: bool) {
-    let base_title = if state.has_image() {
-        // 获取文件路径
+fn window_title_base(state: &ImageState) -> String {
+    if state.has_image() {
         if let Some(ref file_path) = state.current_file_path {
-            // 转换为绝对路径
             let abs_path = match std::fs::canonicalize(file_path) {
                 Ok(path) => path.to_string_lossy().to_string(),
-                Err(_) => file_path.clone(), // 如果无法获取绝对路径，使用原路径
+                Err(_) => file_path.clone(),
             };
-            
-            // 去掉Windows长路径前缀 "\\?\"
             let clean_path = if abs_path.starts_with("\\\\?\\") {
                 &abs_path[4..]
             } else {
                 &abs_path
             };
-            
-            format!("图像查看器 - {}x{} - {}", 
-                state.current_width, 
-                state.current_height,
-                clean_path
-            )
+            format!("图像查看器 - {}x{} - {}", state.current_width, state.current_height, clean_path)
         } else {
-            format!("图像查看器 - {}x{}", 
-                state.current_width, 
-                state.current_height
-            )
+            format!("图像查看器 - {}x{}", state.current_width, state.current_height)
         }
     } else {
         "图像查看器".to_string()
-    };
-    
-    let full_title = if sam_loaded {
-        format!("{} - SAM模型已加载，请按住鼠标左键拖动方框包围对象外围", base_title)
-    } else {
-        base_title
-    };
-    
-    let title_utf16: Vec<u16> = full_title.encode_utf16().chain(std::iter::once(0)).collect();
+    }
+}
+
+unsafe fn refresh_window_title(hwnd: HWND, state: &ImageState) {
+    let mut title = window_title_base(state);
+    if state.selecting && state.color_card_waiting_sam {
+        title.push_str(" - 色卡：请拖框包住整张色卡外围");
+    } else if state.selecting {
+        title.push_str(" - SAM模型已加载，请按住鼠标左键拖动方框包围对象外围");
+    } else if state.straighten_mode {
+        title.push_str(" - 请画一条拉直线");
+    } else if state.manual_perspective_mode.is_some() {
+        let next_corner = ["左上角", "右上角", "右下角", "左下角"];
+        let count = state.manual_perspective_points.len();
+        if let Some(corner) = next_corner.get(count) {
+            title = format!("手动透视矫正 {}/4：请点击{}（Esc 取消） - {}", count, corner, title);
+        }
+    } else if state.has_image() && state.color_card_stage != ColorCardStage::None {
+        title.push_str(" - ");
+        title.push_str(state.color_card_status_text());
+    }
+    let title_utf16: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     SetWindowTextW(hwnd, title_utf16.as_ptr());
+}
+
+unsafe fn update_window_title_with_sam_status(hwnd: HWND, state: &ImageState, _sam_loaded: bool) {
+    refresh_window_title(hwnd, state);
 }
 
 // 更新窗口标题，显示拉直模式状态
@@ -1422,10 +1618,329 @@ unsafe fn window_to_image_coords_clamped(hwnd: HWND, state: &ImageState, win_x: 
     (img_x.clamp(0, state.current_width - 1), img_y.clamp(0, state.current_height - 1))
 }
 
+fn resolve_help_html() -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("help").join("index.html"));
+            candidates.push(dir.join("..").join("..").join("help").join("index.html"));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("help").join("index.html"));
+    }
+    candidates.push(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("help").join("index.html"));
+    for p in candidates {
+        if let Ok(canon) = std::fs::canonicalize(&p) {
+            if canon.is_file() {
+                return Some(canon);
+            }
+        } else if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+unsafe fn open_user_guide(hwnd: HWND) {
+    match resolve_help_html() {
+        Some(path) => {
+            let path_utf16: Vec<u16> = path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+            let op_utf16: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+            let rc = ShellExecuteW(
+                hwnd,
+                op_utf16.as_ptr(),
+                path_utf16.as_ptr(),
+                null_mut(),
+                null_mut(),
+                SW_SHOWNORMAL,
+            );
+            if (rc as usize) <= 32 {
+                show_message(hwnd, "无法打开说明", &format!("无法用浏览器打开：\n{}", path.display()), MB_OK | MB_ICONERROR);
+            }
+        }
+        None => {
+            show_message(
+                hwnd,
+                "找不到说明文件",
+                "没有找到 help\\index.html。\n请把它和程序放在同一套目录里（程序旁的 help 文件夹，或项目根目录的 help 文件夹）。",
+                MB_OK | MB_ICONWARNING,
+            );
+        }
+    }
+}
+
 unsafe fn show_message(hwnd: HWND, title: &str, message: &str, flags: u32) {
     let title_utf16: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     let message_utf16: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
     MessageBoxW(hwnd, message_utf16.as_ptr(), title_utf16.as_ptr(), flags);
+}
+
+unsafe fn start_sam_box_mode(hwnd: HWND, state: &mut ImageState, for_color_card: bool) -> bool {
+    if state.is_grayscale {
+        show_message(hwnd, "SAM分割限制", "SAM分割功能不支持灰度图或黑白图，请使用彩色图像或点击「恢复原图」。", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    let current = match state.current_mat.clone() {
+        Some(mat) => mat,
+        None => {
+            show_message(hwnd, "提示", "没有可用的图像，请先加载图像。", MB_OK | MB_ICONINFORMATION);
+            return false;
+        }
+    };
+    SetCursor(LoadCursorW(null_mut(), IDC_WAIT));
+    let encoded = state.init_sam_processor().and_then(|_| {
+        state.sam_processor.as_mut().unwrap().encode_image(&current)
+    });
+    SetCursor(LoadCursorW(null_mut(), IDC_ARROW));
+    match encoded {
+        Ok(()) => {
+            state.selecting = true;
+            state.select_start = None;
+            state.select_end = None;
+            state.color_card_waiting_sam = for_color_card;
+            refresh_window_title(hwnd, state);
+            if for_color_card {
+                show_message(
+                    hwnd,
+                    "框出色卡",
+                    "模型已就绪。\n\n请按住鼠标左键拖一个方框，包住整张色卡外围，然后松开。\n松开后会自动抠出色卡。",
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            }
+            true
+        }
+        Err(e) => {
+            state.color_card_waiting_sam = false;
+            show_message(hwnd, "编码失败", &format!("SAM编码失败：\n{}\n\n请确认 vit_t_encoder.onnx / vit_t_decoder.onnx 在程序目录。", e), MB_OK | MB_ICONERROR);
+            false
+        }
+    }
+}
+
+unsafe fn start_manual_perspective_mode(hwnd: HWND, state: &mut ImageState, mode: ManualPerspectiveMode) {
+    if state.current_mat.is_none() {
+        show_message(hwnd, "手动透视矫正", "请先打开一张照片。", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    state.selection_mode = false;
+    state.selection_start = None;
+    state.selection_end = None;
+    state.straighten_mode = false;
+    state.straighten_start = None;
+    state.straighten_end = None;
+    state.selecting = false;
+    state.select_start = None;
+    state.select_end = None;
+    state.color_card_waiting_sam = false;
+    state.pan_mode = false;
+    state.pan_start = None;
+    state.show_nav_arrows = false;
+    state.mouse_in_left_arrow = false;
+    state.mouse_in_right_arrow = false;
+    ReleaseCapture();
+    state.manual_perspective_mode = Some(mode);
+    state.manual_perspective_points.clear();
+    refresh_window_title(hwnd, state);
+    InvalidateRect(hwnd, null_mut(), 1);
+}
+
+unsafe fn apply_manual_perspective(
+    hwnd: HWND,
+    state: &mut ImageState,
+    mut corners: [core::Point2f; 4],
+    mode: ManualPerspectiveMode,
+    ordered: bool,
+) -> Result<()> {
+    let full = if state.current_is_original && !state.is_full_resolution_loaded {
+        let path = state.full_resolution_path.as_deref().context("没有原图路径")?;
+        Some(ImageState::read_bgr_from_path(path).context("无法读取完整分辨率原图")?)
+    } else {
+        None
+    };
+    let source = full.as_ref().or(state.current_mat.as_ref()).context("没有打开的图像")?;
+    let scale_x = source.cols() as f32 / state.current_width as f32;
+    let scale_y = source.rows() as f32 / state.current_height as f32;
+    for corner in &mut corners {
+        corner.x *= scale_x;
+        corner.y *= scale_y;
+    }
+    let transformed = if ordered {
+        cv_ops::warp_perspective_quad(source, corners)?
+    } else {
+        cv_ops::perspective_transform_from_points(source, corners)?
+    };
+    state.update_display_from_mat(&transformed)?;
+    if let Some(full) = full {
+        state.original_bgr = Some(full);
+    }
+    state.is_full_resolution_loaded = true;
+    state.current_mask = None;
+    if let Some(sam) = &mut state.sam_processor {
+        sam.reset();
+    }
+    state.cancel_manual_perspective();
+    state.reset_zoom();
+    state.reset_color_card();
+    if mode == ManualPerspectiveMode::ColorCard {
+        state.color_card_stage = ColorCardStage::Rectified;
+    }
+    state.update_sam_menu_state(hwnd);
+    state.update_color_card_menu_state(hwnd);
+    refresh_window_title(hwnd, state);
+    InvalidateRect(hwnd, null_mut(), 1);
+    Ok(())
+}
+
+unsafe fn run_auto_perspective(hwnd: HWND, state: &mut ImageState) -> bool {
+    if state.current_mat.is_none() {
+        show_message(hwnd, "提示", "没有可用的图像，请先加载图像。", MB_OK | MB_ICONINFORMATION);
+        return false;
+    }
+    if state.color_card_stage == ColorCardStage::None {
+        if let Err(e) = state.ensure_full_resolution() {
+            println!("⚠️ 无法加载完整分辨率: {}，使用当前图像继续透视变换", e);
+        }
+    }
+    let current_mat = state.current_mat.as_ref().unwrap();
+    match cv_ops::perspective_transform_simplified(current_mat) {
+        Ok(Some(transformed)) => {
+            if state.update_display_from_mat(&transformed).is_ok() {
+                state.color_card_stage = ColorCardStage::Rectified;
+                state.is_full_resolution_loaded = true;
+                state.update_color_card_menu_state(hwnd);
+                refresh_window_title(hwnd, state);
+                InvalidateRect(hwnd, null_mut(), 1);
+                true
+            } else {
+                show_message(hwnd, "透视变换失败", "拉正完成，但无法更新显示。", MB_OK | MB_ICONERROR);
+                false
+            }
+        }
+        Ok(None) => {
+            show_message(hwnd, "透视变换失败", "未能检测到色卡四个角。\n\n可以改用「手动四点拉正色卡」，依次点击色卡四角。", MB_OK | MB_ICONWARNING);
+            false
+        }
+        Err(e) => {
+            show_message(hwnd, "透视变换失败", &format!("透视变换出错：\n{}", e), MB_OK | MB_ICONERROR);
+            false
+        }
+    }
+}
+
+unsafe fn run_extract_color_blocks(hwnd: HWND, state: &mut ImageState) -> bool {
+    let current = match state.current_mat.clone() {
+        Some(mat) => mat,
+        None => {
+            show_message(hwnd, "提示", "没有可用的图像，请先加载或拉正色卡。", MB_OK | MB_ICONINFORMATION);
+            return false;
+        }
+    };
+    match cv_ops::extract_color_blocks_grid(&current) {
+        Ok(result) => {
+            if state.update_display_from_mat(&result.grid_image).is_err() {
+                show_message(hwnd, "色块提取失败", "无法显示网格划分结果。", MB_OK | MB_ICONERROR);
+                return false;
+            }
+            InvalidateRect(hwnd, null_mut(), 1);
+            if !show_next_step_dialog(hwnd, "网格划分完成",
+                "已完成网格划分，当前显示的是网格线和色块编号。\n\n点击「确定」继续查看色卡参考图，或点击「取消」停止。")
+            {
+                let _ = ocv_bridge::save_debug_image(&result.grid_image, "grid_04_grid_lines.png");
+                return false;
+            }
+            let _ = ocv_bridge::save_debug_image(&result.grid_image, "grid_04_grid_lines.png");
+            if state.update_display_from_mat(&result.color_palette).is_err() {
+                return false;
+            }
+            InvalidateRect(hwnd, null_mut(), 1);
+            let _ = ocv_bridge::save_debug_image(&result.color_palette, "grid_05_color_palette.png");
+            let mut result_msg = String::from("成功提取了24个色块的RGB值：\n\n");
+            for (i, block) in result.color_blocks.iter().enumerate() {
+                if i < 8 {
+                    result_msg.push_str(&format!(
+                        "色块{}: RGB({},{},{}) {}\n",
+                        block.block_number, block.r, block.g, block.b, block.hex
+                    ));
+                }
+            }
+            if result.color_blocks.len() > 8 {
+                result_msg.push_str("...\n");
+            }
+            result_msg.push_str("\n详细信息已保存到调试输出目录。\n当前显示的是24个色块的色卡参考图。");
+            state.color_card_stage = ColorCardStage::ColorsRead;
+            state.update_color_card_menu_state(hwnd);
+            refresh_window_title(hwnd, state);
+            show_message(hwnd, "色块提取成功", &result_msg, MB_OK | MB_ICONINFORMATION);
+            true
+        }
+        Err(e) => {
+            show_message(hwnd, "色块提取失败", &format!("色块提取失败：\n{}\n\n请先把色卡拉成正视图再读色。", e), MB_OK | MB_ICONERROR);
+            false
+        }
+    }
+}
+
+unsafe fn after_rectified_offer_extract(hwnd: HWND, state: &mut ImageState) {
+    if show_next_step_dialog(hwnd, "色卡已拉正", "已经拉成正视图。\n\n是否读取 24 个色块颜色？") {
+        let _ = run_extract_color_blocks(hwnd, state);
+    }
+}
+
+unsafe fn after_cropped_offer_perspective(hwnd: HWND, state: &mut ImageState) {
+    if !show_next_step_dialog(hwnd, "已抠出色卡", "色卡已从照片中抠出。\n\n是否自动拉成正视图？") {
+        return;
+    }
+    if run_auto_perspective(hwnd, state) {
+        after_rectified_offer_extract(hwnd, state);
+        return;
+    }
+    if show_next_step_dialog(hwnd, "改用手动", "自动拉正没有找到四个角。\n\n是否改用手动点击色卡四个角？") {
+        start_manual_perspective_mode(hwnd, state, ManualPerspectiveMode::ColorCard);
+    }
+}
+
+unsafe fn run_color_card_wizard(hwnd: HWND, state: &mut ImageState) {
+    if !state.has_image() {
+        show_message(hwnd, "提示", "请先打开一张色卡照片。", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    if state.is_grayscale {
+        show_message(hwnd, "提示", "请使用彩色照片，或先「恢复原图」。", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    match state.color_card_stage {
+        ColorCardStage::ColorsRead => {
+            if show_next_step_dialog(hwnd, "色卡测色向导", "这张图已经读过颜色。\n\n确定：再读一次。\n取消：结束向导。") {
+                let _ = run_extract_color_blocks(hwnd, state);
+            }
+        }
+        ColorCardStage::Rectified => {
+            after_rectified_offer_extract(hwnd, state);
+        }
+        ColorCardStage::Cropped => {
+            after_cropped_offer_perspective(hwnd, state);
+        }
+        ColorCardStage::None => {
+            let choice = {
+                let title_utf16: Vec<u16> = "色卡测色向导".encode_utf16().chain(std::iter::once(0)).collect();
+                let msg = "这是一张拍歪的色卡照片吗？\n\n\
+选「是」：下一步请框住整张色卡，程序会抠图再拉正、读色。\n\
+选「否」：当作已经拉正的色卡，直接读取颜色。\n\
+选「取消」：退出向导。";
+                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_YESNOCANCEL | MB_ICONQUESTION)
+            };
+            if choice == IDYES {
+                let _ = start_sam_box_mode(hwnd, state, true);
+            } else if choice == IDNO {
+                state.color_card_stage = ColorCardStage::Rectified;
+                state.update_color_card_menu_state(hwnd);
+                refresh_window_title(hwnd, state);
+                let _ = run_extract_color_blocks(hwnd, state);
+            }
+        }
+    }
 }
 
 unsafe fn finish_sam_selection(hwnd: HWND, state: &mut ImageState) {
@@ -1479,8 +1994,26 @@ unsafe fn finish_sam_selection(hwnd: HWND, state: &mut ImageState) {
                         if let Some(ref mut sam) = state.sam_processor {
                             sam.reset();
                         }
-                        update_window_title_with_sam_status(hwnd, state, false);
-                        show_message(hwnd, "分割完成", "已用绿色半透明遮罩标出对象。\n\n需要抠出来时，再点「SAM分割」→「抠图并显示」。", MB_OK | MB_ICONINFORMATION);
+                        if state.color_card_waiting_sam {
+                            state.color_card_waiting_sam = false;
+                            match extract_mask_and_display(state) {
+                                Ok(()) => {
+                                    state.color_card_stage = ColorCardStage::Cropped;
+                                    state.is_full_resolution_loaded = true;
+                                    state.update_color_card_menu_state(hwnd);
+                                    refresh_window_title(hwnd, state);
+                                    InvalidateRect(hwnd, null_mut(), 1);
+                                    after_cropped_offer_perspective(hwnd, state);
+                                }
+                                Err(e) => {
+                                    refresh_window_title(hwnd, state);
+                                    show_message(hwnd, "抠图失败", &format!("色卡已框选，但抠图失败：\n{}", e), MB_OK | MB_ICONERROR);
+                                }
+                            }
+                        } else {
+                            refresh_window_title(hwnd, state);
+                            show_message(hwnd, "分割完成", "已用绿色半透明遮罩标出对象。\n\n需要抠出来时，再点「SAM分割」→「抠图并显示」。", MB_OK | MB_ICONINFORMATION);
+                        }
                     }
                     Err(e) => {
                         update_window_title_with_sam_status(hwnd, state, true);
@@ -1757,6 +2290,7 @@ fn extract_mask_and_display(state: &mut ImageState) -> Result<()> {
     
     // 更新显示
     state.update_display_from_mat(&result)?;
+    state.is_full_resolution_loaded = true;
     
     Ok(())
 }
@@ -1783,6 +2317,7 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                         
                         // 更新SAM菜单状态（新图像默认为彩色图）
                         state.update_sam_menu_state(hwnd);
+                        state.update_color_card_menu_state(hwnd);
                         
                         InvalidateRect(hwnd, null_mut(), 1);
                     }
@@ -1799,34 +2334,9 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
         MENU_EXIF_PANEL => {
             toggle_exif_panel(hwnd);
         }
-        MENU_SAVE_FILE => {
-            if let Some(ref mat) = state.current_mat {
-                // 确保加载完整分辨率以保存最佳质量
-                if let Err(e) = state.ensure_full_resolution() {
-                    println!("⚠️ 无法加载完整分辨率: {}，将保存当前版本", e);
-                }
-                
-                if let Some(path) = show_save_file_dialog(hwnd) {
-                    // 重新获取mat（可能已更新为完整分辨率）
-                    let mat_to_save = state.current_mat.as_ref().unwrap();
-                    match save_mat_with_unicode_path(mat_to_save, &path) {
-                        Ok(final_path) => {
-                            println!("✅ 已保存: {}", final_path);
-                        }
-                        Err(e) => {
-                            println!("❌ 保存失败: {}", e);
-                            let error_msg = format!("无法保存到:\n{}\n\n错误信息: {}", path, e);
-                            let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                            let title_utf16: Vec<u16> = "保存错误".encode_utf16().chain(std::iter::once(0)).collect();
-                            MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
-                        }
-                    }
-                }
-            } else {
-                let msg = "没有可保存的图像，请先进行处理或打开图像";
-                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
+        MENU_SAVE_FILE | MENU_SAVE_AS => {
+            if let Err(error) = save_from_menu(hwnd, state, command_id == MENU_SAVE_AS) {
+                show_message(hwnd, "保存失败", &format!("{:#}", error), MB_OK | MB_ICONERROR);
             }
         }
         MENU_CLOSE_FILE => {
@@ -1834,6 +2344,7 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 state.close_current_file();
                 // 更新窗口标题为初始状态
                 update_window_title_with_sam_status(hwnd, state, false);
+                state.update_color_card_menu_state(hwnd);
                 // 重绘窗口以显示黑屏状态
                 InvalidateRect(hwnd, null_mut(), 1);
             } else {
@@ -2017,70 +2528,29 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                 }
             }
         }
+        MENU_HELP_GUIDE => {
+            open_user_guide(hwnd);
+        }
+        MENU_COLOR_CARD_WIZARD => {
+            run_color_card_wizard(hwnd, state);
+        }
+        MENU_COLOR_CARD_SAM_CROP => {
+            let _ = start_sam_box_mode(hwnd, state, true);
+        }
         MENU_PERSPECTIVE_TRANSFORM => {
-            if let Some(ref current) = state.current_mat.clone() {
-                // 确保加载完整分辨率（透视变换需要高质量）
-                if let Err(e) = state.ensure_full_resolution() {
-                    println!("❌ 加载完整分辨率失败: {}", e);
-                    let error_msg = format!("无法加载完整分辨率图像：{}", e);
-                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                    let title_utf16: Vec<u16> = "错误".encode_utf16().chain(std::iter::once(0)).collect();
-                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
-                    return;
-                }
-                
-                println!("开始简化透视变换...");
-                // 重新获取mat（可能已更新为完整分辨率）
-                let current_mat = state.current_mat.as_ref().unwrap();
-                match cv_ops::perspective_transform_simplified(current_mat) {
-                    Ok(Some(transformed)) => {
-                        if let Ok(()) = state.update_display_from_mat(&transformed) {
-                            println!("✅ 简化透视变换完成");
-                            InvalidateRect(hwnd, null_mut(), 1);
-                        }
-                    }
-                    Ok(None) => {
-                        println!("❌ 透视变换失败：未能检测到色卡");
-                        let msg = "未能检测到色卡，请确保图像中包含清晰的矩形色卡";
-                        let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                        let title_utf16: Vec<u16> = "透视变换失败".encode_utf16().chain(std::iter::once(0)).collect();
-                        MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONWARNING);
-                    }
-                    Err(e) => {
-                        println!("❌ 透视变换出错: {}", e);
-                    }
+            if run_auto_perspective(hwnd, state) {
+                after_rectified_offer_extract(hwnd, state);
+            } else if state.color_card_stage == ColorCardStage::Cropped {
+                if show_next_step_dialog(hwnd, "改用手动", "自动拉正没有找到四个角。\n\n是否改用手动点击色卡四个角？") {
+                    start_manual_perspective_mode(hwnd, state, ManualPerspectiveMode::ColorCard);
                 }
             }
         }
         MENU_MANUAL_PERSPECTIVE => {
-            if let Some(ref current) = state.current_mat.clone() {
-                // 确保加载完整分辨率（透视变换需要高质量）
-                if let Err(e) = state.ensure_full_resolution() {
-                    println!("❌ 加载完整分辨率失败: {}", e);
-                    let error_msg = format!("无法加载完整分辨率图像：{}", e);
-                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                    let title_utf16: Vec<u16> = "错误".encode_utf16().chain(std::iter::once(0)).collect();
-                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
-                    return;
-                }
-                
-                // 进入手动透视变换模式
-                state.manual_perspective_mode = true;
-                state.manual_perspective_points.clear();
-                
-                let msg = "手动透视变换模式已启动！\n\n请用鼠标左键在图像上依次点击四个角点：\n1. 左上角\n2. 右上角\n3. 右下角\n4. 左下角\n\n点击完成后，程序将自动执行透视变换。\n\n按ESC键可以取消操作。";
-                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                let title_utf16: Vec<u16> = "手动透视变换".encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
-                
-                println!("✅ 手动透视变换模式已启动，等待用户选择四个角点...");
-                InvalidateRect(hwnd, null_mut(), 1);
-            } else {
-                let msg = "没有可用的图像，请先加载图像";
-                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                let title_utf16: Vec<u16> = "错误".encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
-            }
+            start_manual_perspective_mode(hwnd, state, ManualPerspectiveMode::General);
+        }
+        MENU_COLOR_CARD_MANUAL => {
+            start_manual_perspective_mode(hwnd, state, ManualPerspectiveMode::ColorCard);
         }
         MENU_TEMPLATE_MATCHING => {
             if let Some(ref scene) = state.current_mat.clone() {
@@ -2123,6 +2593,7 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
                                             if let Some(ref warped) = result.warped_image {
                                                 // 更新显示并同时更新current_mat为裁剪后的图像
                                                 state.current_mat = Some(warped.clone());
+                                                state.current_is_original = false;
                                                 if let Ok(()) = state.update_display_from_mat(warped) {
                                                     InvalidateRect(hwnd, null_mut(), 1);
                                                     
@@ -2172,87 +2643,19 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             }
         }
         MENU_EXTRACT_COLOR_BLOCKS => {
-            if let Some(ref current) = state.current_mat.clone() {
-                println!("开始从当前显示的图像中提取色块颜色...");
-                match cv_ops::extract_color_blocks_grid(&current) {
-                    Ok(result) => {
-                        println!("✅ 成功提取了 {} 个色块", result.color_blocks.len());
-                        
-                        // 第一步：显示网格划分图像
-                        if let Ok(()) = state.update_display_from_mat(&result.grid_image) {
-                            InvalidateRect(hwnd, null_mut(), 1);
-                            
-                            // 显示"下一步"对话框
-                            if show_next_step_dialog(hwnd, "网格划分完成", 
-                                "已完成网格划分，当前显示的是网格线和色块编号。\n\n点击\"确定\"继续查看色卡参考图，或点击\"取消\"停止。") {
-                                
-                                // 保存网格图像
-                                if let Err(e) = ocv_bridge::save_debug_image(&result.grid_image, "grid_04_grid_lines.png") {
-                                    println!("保存网格图像失败: {}", e);
-                                }
-                                
-                                // 第二步：显示色卡参考图
-                                if let Ok(()) = state.update_display_from_mat(&result.color_palette) {
-                                    InvalidateRect(hwnd, null_mut(), 1);
-                                    
-                                    // 保存色卡参考图
-                                    if let Err(e) = ocv_bridge::save_debug_image(&result.color_palette, "grid_05_color_palette.png") {
-                                        println!("保存色卡参考图失败: {}", e);
-                                    }
-                                    
-                                    // 显示提取结果的详细信息
-                                    let mut result_msg = String::from("成功提取了24个色块的RGB值：\n\n");
-                                    for (i, block) in result.color_blocks.iter().enumerate() {
-                                        if i < 8 {  // 只显示前8个，避免消息框过长
-                                            result_msg.push_str(&format!(
-                                                "色块{}: RGB({},{},{}) {}\n",
-                                                block.block_number, block.r, block.g, block.b, block.hex
-                                            ));
-                                        }
-                                    }
-                                    if result.color_blocks.len() > 8 {
-                                        result_msg.push_str("...\n");
-                                    }
-                                    result_msg.push_str("\n详细信息已保存到调试输出目录\n当前显示的是24个色块的色卡参考图");
-                                    
-                                    let msg_utf16: Vec<u16> = result_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                                    let title_utf16: Vec<u16> = "色块提取成功".encode_utf16().chain(std::iter::once(0)).collect();
-                                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
-                                } else {
-                                    println!("❌ 更新色卡参考图显示失败");
-                                }
-                            } else {
-                                println!("用户取消了色块提取过程");
-                                // 保存网格图像（即使用户取消也保存）
-                                if let Err(e) = ocv_bridge::save_debug_image(&result.grid_image, "grid_04_grid_lines.png") {
-                                    println!("保存网格图像失败: {}", e);
-                                }
-                            }
-                        } else {
-                            println!("❌ 更新网格图像显示失败");
-                        }
-                    }
-                    Err(e) => {
-                        println!("❌ 色块提取失败: {}", e);
-                        let error_msg = format!("色块提取失败：\n{}\n\n请确保当前显示的是经过透视变换的色卡图像", e);
-                        let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                        let title_utf16: Vec<u16> = "色块提取失败".encode_utf16().chain(std::iter::once(0)).collect();
-                        MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
-                    }
-                }
-            } else {
-                let msg = "没有可用的图像，请先加载图像并进行透视变换";
-                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
-            }
+            let _ = run_extract_color_blocks(hwnd, state);
         }
         MENU_RESTORE => {
             if let Some(ref original) = state.original_bgr.clone() {
                 if let Ok(()) = state.update_display_from_mat(&original) {
-                    state.is_grayscale = false; // 重置为彩色图状态
-                    state.reset_zoom(); // 重置缩放和平移状态，让图像居中显示
-                    state.update_sam_menu_state(hwnd); // 更新SAM菜单状态
+                    state.current_is_original = true;
+                    state.cancel_manual_perspective();
+                    state.is_grayscale = false;
+                    state.reset_zoom();
+                    state.reset_color_card();
+                    state.update_sam_menu_state(hwnd);
+                    state.update_color_card_menu_state(hwnd);
+                    refresh_window_title(hwnd, state);
                     println!("✅ 恢复原图完成");
                     InvalidateRect(hwnd, null_mut(), 1);
                 }
@@ -2396,56 +2799,7 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
             }
         }
         MENU_SAM_INTERACTIVE => {
-            if state.is_grayscale {
-                let msg = "SAM分割功能不支持灰度图或黑白图，请使用彩色图像或点击'恢复原图'恢复彩色图像";
-                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                let title_utf16: Vec<u16> = "SAM分割限制".encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONWARNING);
-                return;
-            }
-            
-            if let Some(ref current) = state.current_mat.clone() {
-                // 首先初始化SAM处理器并编码图像
-                match state.init_sam_processor() {
-                    Ok(()) => {
-                        if let Some(ref mut sam) = state.sam_processor {
-                            match sam.encode_image(current) {
-                                Ok(()) => {
-                                    println!("✅ SAM图像编码完成");
-                                    
-                                    // 更新窗口标题显示SAM模型已加载
-                                    update_window_title_with_sam_status(hwnd, state, true);
-                                    
-                                    // 编码成功后立即进入交互分割模式
-                                    state.selecting = true;
-                                    state.select_start = None;
-                                    state.select_end = None;
-                                    println!("🖱️ SAM交互分割：请在图像上按下并拖拽以框选目标，释放鼠标完成框选");
-                                }
-                                Err(e) => {
-                                    println!("❌ SAM编码失败: {}", e);
-                                    let error_msg = format!("SAM编码失败：\n{}", e);
-                                    let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                                    let title_utf16: Vec<u16> = "编码失败".encode_utf16().chain(std::iter::once(0)).collect();
-                                    MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("❌ SAM处理器初始化失败: {}", e);
-                        let error_msg = format!("SAM处理器初始化失败：\n{}\n\n请确保ONNX模型文件存在", e);
-                        let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                        let title_utf16: Vec<u16> = "初始化失败".encode_utf16().chain(std::iter::once(0)).collect();
-                        MessageBoxW(hwnd, error_msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
-                    }
-                }
-            } else {
-                let msg = "没有可用的图像，请先加载图像";
-                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                let title_utf16: Vec<u16> = "提示".encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
-            }
+            let _ = start_sam_box_mode(hwnd, state, false);
         }
         
         MENU_SAM_EXTRACT_MASK => {
@@ -2545,6 +2899,241 @@ unsafe fn handle_menu_command(hwnd: HWND, command_id: u32) {
     }
 }
 
+fn ipc_ok(id: u64, data: serde_json::Value) -> String {
+    serde_json::to_string(&ipc::IpcResponse { id, ok: true, error: None, data: Some(data) }).unwrap_or_else(|_| "{\"ok\":false}".into())
+}
+
+fn ipc_err(id: u64, err: impl ToString) -> String {
+    serde_json::to_string(&ipc::IpcResponse { id, ok: false, error: Some(err.to_string()), data: None }).unwrap_or_else(|_| "{\"ok\":false}".into())
+}
+
+fn color_card_stage_id(stage: ColorCardStage) -> &'static str {
+    match stage {
+        ColorCardStage::None => "none",
+        ColorCardStage::Cropped => "cropped",
+        ColorCardStage::Rectified => "rectified",
+        ColorCardStage::ColorsRead => "colors_read",
+    }
+}
+
+unsafe fn snapshot_status(state: &ImageState) -> serde_json::Value {
+    serde_json::json!({
+        "path": state.current_file_path,
+        "width": state.current_width,
+        "height": state.current_height,
+        "has_image": state.has_image(),
+        "grayscale": state.is_grayscale,
+        "color_card_stage": color_card_stage_id(state.color_card_stage),
+        "color_card_label": state.color_card_status_text(),
+        "has_mask": state.has_mask(),
+    })
+}
+
+unsafe fn handle_ipc_line(hwnd: HWND, line: &str) -> String {
+    let req: ipc::IpcRequest = match serde_json::from_str(line) {
+        Ok(r) => r,
+        Err(e) => return ipc_err(0, e),
+    };
+    match handle_ipc(hwnd, &req) {
+        Ok(data) => ipc_ok(req.id, data),
+        Err(e) => ipc_err(req.id, e),
+    }
+}
+
+unsafe fn handle_ipc(hwnd: HWND, req: &ipc::IpcRequest) -> Result<serde_json::Value> {
+    let state = IMAGE_STATE.as_mut().ok_or_else(|| anyhow::anyhow!("界面未就绪"))?;
+    match req.cmd.as_str() {
+        "ping" => Ok(serde_json::json!({"pong": true})),
+        "status" => Ok(snapshot_status(state)),
+        "open" => {
+            let path = req.path.as_deref().ok_or_else(|| anyhow::anyhow!("缺少 path"))?;
+            state.load_image(path)?;
+            if let Some(ref mut sam) = state.sam_processor {
+                sam.reset();
+            }
+            state.update_sam_menu_state(hwnd);
+            state.update_color_card_menu_state(hwnd);
+            refresh_window_title(hwnd, state);
+            InvalidateRect(hwnd, null_mut(), 1);
+            Ok(snapshot_status(state))
+        }
+        "save" => {
+            let path = req.path.as_deref().ok_or_else(|| anyhow::anyhow!("缺少 path"))?;
+            let mat = state.current_mat.as_ref().ok_or_else(|| anyhow::anyhow!("没有打开的图像"))?;
+            let saved = save_mat_with_unicode_path(mat, path)?;
+            Ok(serde_json::json!({"saved": saved}))
+        }
+        "close" => {
+            state.close_current_file();
+            state.update_color_card_menu_state(hwnd);
+            refresh_window_title(hwnd, state);
+            InvalidateRect(hwnd, null_mut(), 1);
+            Ok(serde_json::json!({"closed": true}))
+        }
+        "restore" => {
+            let original = state.original_bgr.as_ref().ok_or_else(|| anyhow::anyhow!("没有原图"))?.try_clone()?;
+            state.update_display_from_mat(&original)?;
+            state.current_is_original = true;
+            state.cancel_manual_perspective();
+            state.is_grayscale = false;
+            state.reset_zoom();
+            state.reset_color_card();
+            state.update_sam_menu_state(hwnd);
+            state.update_color_card_menu_state(hwnd);
+            refresh_window_title(hwnd, state);
+            InvalidateRect(hwnd, null_mut(), 1);
+            Ok(snapshot_status(state))
+        }
+        "gray" => {
+            let current = state.current_mat.as_ref().ok_or_else(|| anyhow::anyhow!("没有打开的图像"))?.try_clone()?;
+            let gray = cv_ops::to_gray(&current)?;
+            state.update_display_from_mat(&gray)?;
+            state.is_grayscale = true;
+            state.update_sam_menu_state(hwnd);
+            InvalidateRect(hwnd, null_mut(), 1);
+            Ok(snapshot_status(state))
+        }
+        "canny" => {
+            let current = state.current_mat.as_ref().ok_or_else(|| anyhow::anyhow!("没有打开的图像"))?.try_clone()?;
+            let edges = cv_ops::to_gray(&current)
+                .and_then(|g| cv_ops::gaussian(&g, 5, 0.0))
+                .and_then(|b| cv_ops::canny(&b, 50.0, 150.0))?;
+            state.update_display_from_mat(&edges)?;
+            state.is_grayscale = true;
+            state.update_sam_menu_state(hwnd);
+            InvalidateRect(hwnd, null_mut(), 1);
+            Ok(snapshot_status(state))
+        }
+        "threshold" => {
+            let current = state.current_mat.as_ref().ok_or_else(|| anyhow::anyhow!("没有打开的图像"))?.try_clone()?;
+            let binary = cv_ops::to_gray(&current)
+                .and_then(|g| cv_ops::adaptive_threshold(&g, 255.0, 11, 2.0))?;
+            state.update_display_from_mat(&binary)?;
+            state.is_grayscale = true;
+            state.update_sam_menu_state(hwnd);
+            InvalidateRect(hwnd, null_mut(), 1);
+            Ok(snapshot_status(state))
+        }
+        "auto_perspective" => {
+            if state.color_card_stage == ColorCardStage::None {
+                let _ = state.ensure_full_resolution();
+            }
+            let current = state.current_mat.as_ref().ok_or_else(|| anyhow::anyhow!("没有打开的图像"))?.try_clone()?;
+            match cv_ops::perspective_transform_simplified(&current)? {
+                Some(transformed) => {
+                    state.update_display_from_mat(&transformed)?;
+                    state.color_card_stage = ColorCardStage::Rectified;
+                    state.is_full_resolution_loaded = true;
+                    state.update_color_card_menu_state(hwnd);
+                    refresh_window_title(hwnd, state);
+                    InvalidateRect(hwnd, null_mut(), 1);
+                    Ok(snapshot_status(state))
+                }
+                None => Err(anyhow::anyhow!("未能检测到色卡四个角")),
+            }
+        }
+        "extract_colors" => {
+            let current = state.current_mat.as_ref().ok_or_else(|| anyhow::anyhow!("没有打开的图像"))?.try_clone()?;
+            let result = cv_ops::extract_color_blocks_grid(&current)?;
+            let _ = ocv_bridge::save_debug_image(&result.grid_image, "grid_04_grid_lines.png");
+            let _ = ocv_bridge::save_debug_image(&result.color_palette, "grid_05_color_palette.png");
+            state.update_display_from_mat(&result.color_palette)?;
+            state.color_card_stage = ColorCardStage::ColorsRead;
+            state.update_color_card_menu_state(hwnd);
+            refresh_window_title(hwnd, state);
+            InvalidateRect(hwnd, null_mut(), 1);
+            let blocks: Vec<serde_json::Value> = result.color_blocks.iter().map(|b| {
+                serde_json::json!({
+                    "n": b.block_number, "r": b.r, "g": b.g, "b": b.b, "hex": b.hex
+                })
+            }).collect();
+            Ok(serde_json::json!({"blocks": blocks, "count": blocks.len()}))
+        }
+        "sam_crop" => {
+            let x1 = req.x1.ok_or_else(|| anyhow::anyhow!("缺少 x1"))?;
+            let y1 = req.y1.ok_or_else(|| anyhow::anyhow!("缺少 y1"))?;
+            let x2 = req.x2.ok_or_else(|| anyhow::anyhow!("缺少 x2"))?;
+            let y2 = req.y2.ok_or_else(|| anyhow::anyhow!("缺少 y2"))?;
+            let current = state.current_mat.as_ref().ok_or_else(|| anyhow::anyhow!("没有打开的图像"))?.try_clone()?;
+            state.init_sam_processor()?;
+            {
+                let sam = state.sam_processor.as_mut().unwrap();
+                sam.encode_image(&current)?;
+            }
+            let (fx1, fy1) = (x1.min(x2), y1.min(y2));
+            let (fx2, fy2) = (x1.max(x2), y1.max(y2));
+            let (mask, mw, mh) = {
+                let sam = state.sam_processor.as_ref().unwrap();
+                sam.decode_prompt(fx1, fy1, fx2, fy2)?
+            };
+            state.set_current_mask(mask.clone(), mw as i32, mh as i32);
+            extract_mask_and_display(state)?;
+            if let Some(ref mut sam) = state.sam_processor {
+                sam.reset();
+            }
+            state.color_card_stage = ColorCardStage::Cropped;
+            state.is_full_resolution_loaded = true;
+            state.update_color_card_menu_state(hwnd);
+            refresh_window_title(hwnd, state);
+            InvalidateRect(hwnd, null_mut(), 1);
+            Ok(snapshot_status(state))
+        }
+        "manual_perspective" => {
+            let points = req.points.as_deref().context("缺少 points（4 个 [x,y]）")?;
+            let points: &[[f32; 2]; 4] = points.try_into().map_err(|_| anyhow::anyhow!("需要正好 4 个点"))?;
+            let corners = points.map(|[x, y]| core::Point2f::new(x, y));
+            // Keep the color-card stage expected by existing IPC workflows.
+            apply_manual_perspective(hwnd, state, corners, ManualPerspectiveMode::ColorCard, false)?;
+            Ok(snapshot_status(state))
+        }
+        "rotate" => {
+            let current = state.current_mat.as_ref().ok_or_else(|| anyhow::anyhow!("没有打开的图像"))?.try_clone()?;
+            let dir = req.dir.clone().unwrap_or_default();
+            let rotated = if dir == "90cw" {
+                rotate_image_90_cw(&current)?
+            } else if dir == "90ccw" {
+                rotate_image_90_ccw(&current)?
+            } else if dir == "180" {
+                rotate_image_180(&current)?
+            } else if let Some(a) = req.angle {
+                rotate_image_angle(&current, a)?
+            } else if let Ok(a) = dir.parse::<f64>() {
+                rotate_image_angle(&current, a)?
+            } else {
+                return Err(anyhow::anyhow!("dir 用 90cw / 90ccw / 180，或提供 angle"));
+            };
+            state.update_display_from_mat(&rotated)?;
+            InvalidateRect(hwnd, null_mut(), 1);
+            Ok(snapshot_status(state))
+        }
+        "next" => {
+            state.load_next_image()?;
+            state.update_sam_menu_state(hwnd);
+            state.update_color_card_menu_state(hwnd);
+            refresh_window_title(hwnd, state);
+            InvalidateRect(hwnd, null_mut(), 1);
+            Ok(snapshot_status(state))
+        }
+        "prev" => {
+            state.load_previous_image()?;
+            state.update_sam_menu_state(hwnd);
+            state.update_color_card_menu_state(hwnd);
+            refresh_window_title(hwnd, state);
+            InvalidateRect(hwnd, null_mut(), 1);
+            Ok(snapshot_status(state))
+        }
+        "screenshot" => {
+            let (client, window) = screenshot::capture_viewer(hwnd, req.path.as_deref())?;
+            Ok(serde_json::json!({
+                "client": client.to_string_lossy(),
+                "window": window.to_string_lossy(),
+                "note": "client=客户区画面（不含标题栏菜单）；window=整个活动窗口（含标题栏和菜单）"
+            }))
+        }
+        other => Err(anyhow::anyhow!("未知命令: {}", other)),
+    }
+}
+
 // 窗口过程函数
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
@@ -2575,16 +3164,10 @@ unsafe extern "system" fn window_proc(
             let key_code = (wparam & 0xFFFF) as u32;
             if key_code == 0x1B { // VK_ESCAPE
                 let state = IMAGE_STATE.as_mut().unwrap();
-                if state.manual_perspective_mode {
-                    println!("🔄 用户按ESC键，退出手动透视变换模式");
-                    state.manual_perspective_mode = false;
-                    state.manual_perspective_points.clear();
+                if state.manual_perspective_mode.is_some() {
+                    state.cancel_manual_perspective();
+                    refresh_window_title(hwnd, state);
                     InvalidateRect(hwnd, null_mut(), 1);
-                    
-                    let msg = "已退出手动透视变换模式";
-                    let msg_utf16: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                    let title_utf16: Vec<u16> = "操作取消".encode_utf16().chain(std::iter::once(0)).collect();
-                    MessageBoxW(hwnd, msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
                 }
             }
             0
@@ -2595,6 +3178,33 @@ unsafe extern "system" fn window_proc(
                 let mx = (lparam & 0xFFFF) as u16 as i16 as i32;
                 let my = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
                 
+                if let Some(mode) = state.manual_perspective_mode {
+                    if let Some((x, y)) = window_to_image_coords_with_zoom(hwnd, state, mx, my) {
+                        state.manual_perspective_points.push((x, y));
+                        if let [(x1, y1), (x2, y2), (x3, y3), (x4, y4)] = state.manual_perspective_points.as_slice() {
+                            let corners = [(*x1, *y1), (*x2, *y2), (*x3, *y3), (*x4, *y4)]
+                                .map(|(x, y)| core::Point2f::new(x as f32, y as f32));
+                            match apply_manual_perspective(hwnd, state, corners, mode, true) {
+                                Ok(()) if mode == ManualPerspectiveMode::ColorCard => {
+                                    after_rectified_offer_extract(hwnd, state);
+                                }
+                                Ok(()) => {}
+                                Err(error) => {
+                                    state.manual_perspective_points.clear();
+                                    refresh_window_title(hwnd, state);
+                                    InvalidateRect(hwnd, null_mut(), 1);
+                                    let message = format!("{}\n\n请重新从左上角开始，顺时针点击四角。", error);
+                                    show_message(hwnd, "手动透视矫正失败", &message, MB_OK | MB_ICONWARNING);
+                                }
+                            }
+                        } else {
+                            refresh_window_title(hwnd, state);
+                            InvalidateRect(hwnd, null_mut(), 1);
+                        }
+                    }
+                    return 0;
+                }
+
                 if state.selecting {
                     SetCapture(hwnd);
                     let (ix, iy) = window_to_image_coords_clamped(hwnd, state, mx, my);
@@ -2620,7 +3230,7 @@ unsafe extern "system" fn window_proc(
                 }
                 
                 // 检查是否可以平移（不在其他模式）
-                if !state.selection_mode && !state.straighten_mode && !state.manual_perspective_mode {
+                if !state.selection_mode && !state.straighten_mode {
                     if state.can_pan() {
                         // 开始平移模式
                         state.start_pan(mx, my);
@@ -2639,52 +3249,6 @@ unsafe extern "system" fn window_proc(
                         // 拉直工具模式
                         state.straighten_start = Some((ix, iy));
                         state.straighten_end = Some((ix, iy));
-                    } else if state.manual_perspective_mode {
-                        // 手动透视变换模式
-                        state.manual_perspective_points.push((ix, iy));
-                        println!("✅ 手动透视变换：已选择第 {} 个角点 ({}, {})", 
-                            state.manual_perspective_points.len(), ix, iy);
-                        
-                        // 如果已经选择了4个点，执行透视变换
-                        if state.manual_perspective_points.len() == 4 {
-                            if let Some(ref current) = state.current_mat.clone() {
-                                // 将整数坐标转换为浮点坐标
-                                let points: [core::Point2f; 4] = [
-                                    core::Point2f::new(state.manual_perspective_points[0].0 as f32, state.manual_perspective_points[0].1 as f32),
-                                    core::Point2f::new(state.manual_perspective_points[1].0 as f32, state.manual_perspective_points[1].1 as f32),
-                                    core::Point2f::new(state.manual_perspective_points[2].0 as f32, state.manual_perspective_points[2].1 as f32),
-                                    core::Point2f::new(state.manual_perspective_points[3].0 as f32, state.manual_perspective_points[3].1 as f32),
-                                ];
-                                
-                                match cv_ops::perspective_transform_from_points(&current, points) {
-                                    Ok(transformed) => {
-                                        if let Ok(()) = state.update_display_from_mat(&transformed) {
-                                            println!("✅ 手动透视变换完成");
-                                            // 退出手动透视变换模式
-                                            state.manual_perspective_mode = false;
-                                            state.manual_perspective_points.clear();
-                                            InvalidateRect(hwnd, null_mut(), 1);
-                                            
-                                            let success_msg = "手动透视变换完成！\n\n程序已根据您选择的四个角点完成了透视变换。\n当前显示的是变换后的图像。";
-                                            let success_msg_utf16: Vec<u16> = success_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                                            let success_title_utf16: Vec<u16> = "透视变换成功".encode_utf16().chain(std::iter::once(0)).collect();
-                                            MessageBoxW(hwnd, success_msg_utf16.as_ptr(), success_title_utf16.as_ptr(), MB_OK | MB_ICONINFORMATION);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        println!("❌ 手动透视变换失败: {}", e);
-                                        let error_msg = format!("透视变换失败：\n{}", e);
-                                        let error_msg_utf16: Vec<u16> = error_msg.encode_utf16().chain(std::iter::once(0)).collect();
-                                        let error_title_utf16: Vec<u16> = "透视变换失败".encode_utf16().chain(std::iter::once(0)).collect();
-                                        MessageBoxW(hwnd, error_msg_utf16.as_ptr(), error_title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
-                                        
-                                        // 退出手动透视变换模式
-                                        state.manual_perspective_mode = false;
-                                        state.manual_perspective_points.clear();
-                                    }
-                                }
-                            }
-                        }
                     }
                     InvalidateRect(hwnd, null_mut(), 1);
                 }
@@ -2705,7 +3269,9 @@ unsafe extern "system" fn window_proc(
                 
                 // 更新导航箭头状态
                 let old_show_arrows = state.show_nav_arrows;
-                state.update_nav_arrows(mx, my, window_width, window_height);
+                if state.manual_perspective_mode.is_none() {
+                    state.update_nav_arrows(mx, my, window_width, window_height);
+                }
                 
                 // 如果箭头显示状态改变，触发重绘
                 if old_show_arrows != state.show_nav_arrows {
@@ -2715,7 +3281,7 @@ unsafe extern "system" fn window_proc(
                 // 更新光标（只在没有按下鼠标按钮时）
                 if (wparam & MK_LBUTTON as usize) == 0 && !state.pan_mode {
                     // 检查是否可以平移（不在其他模式）
-                    if !state.selecting && !state.selection_mode && !state.straighten_mode && !state.manual_perspective_mode {
+                    if !state.selecting && !state.selection_mode && !state.straighten_mode {
                         if state.can_pan() {
                             state.set_hand_cursor(hwnd);
                         } else {
@@ -2996,7 +3562,7 @@ unsafe extern "system" fn window_proc(
                     }
                     
                     // 新增：手动透视变换角点绘制
-                    if state.manual_perspective_mode && !state.manual_perspective_points.is_empty() {
+                    if state.manual_perspective_mode.is_some() && !state.manual_perspective_points.is_empty() {
                         // 将图像坐标转换回窗口坐标用于绘制
                         let to_win = |ix: i32, iy: i32| -> (i32,i32) {
                             let wx = x + (ix * scaled_width) / state.current_width;
@@ -3030,26 +3596,16 @@ unsafe extern "system" fn window_proc(
                             TextOutW(mem_dc, wx + 12, wy - 8, num_text_utf16.as_ptr(), num_text.len() as i32);
                         }
                         
-                        // 如果已经选择了4个点，绘制连接线
-                        if state.manual_perspective_points.len() == 4 {
-                            let pen = CreatePen(PS_SOLID as i32, 2, RGB(255, 255, 0)); // 黄色连接线
-                            let old_pen = SelectObject(mem_dc, pen as HGDIOBJ);
-                            
-                            // 连接四个角点形成四边形
-                            for i in 0..4 {
-                                let (ix1, iy1) = state.manual_perspective_points[i];
-                                let (ix2, iy2) = state.manual_perspective_points[(i + 1) % 4];
-                                
-                                let (wx1, wy1) = to_win(ix1, iy1);
-                                let (wx2, wy2) = to_win(ix2, iy2);
-                                
-                                MoveToEx(mem_dc, wx1, wy1, null_mut());
-                                LineTo(mem_dc, wx2, wy2);
-                            }
-                            
-                            SelectObject(mem_dc, old_pen);
-                            DeleteObject(pen as HGDIOBJ);
+                        let pen = CreatePen(PS_SOLID as i32, 2, RGB(255, 221, 0));
+                        let old_pen = SelectObject(mem_dc, pen as HGDIOBJ);
+                        for pair in state.manual_perspective_points.windows(2) {
+                            let (x1, y1) = to_win(pair[0].0, pair[0].1);
+                            let (x2, y2) = to_win(pair[1].0, pair[1].1);
+                            MoveToEx(mem_dc, x1, y1, null_mut());
+                            LineTo(mem_dc, x2, y2);
                         }
+                        SelectObject(mem_dc, old_pen);
+                        DeleteObject(pen as HGDIOBJ);
                     }
                     
                     // 更新窗口标题显示图像信息和SAM状态
@@ -3167,8 +3723,13 @@ unsafe extern "system" fn window_proc(
             EndPaint(hwnd, &ps);
             0
         }
+        _ if msg == ipc::WM_IPC_COMMAND => {
+            let job = Box::from_raw(lparam as *mut ipc::IpcJob);
+            let reply = handle_ipc_line(hwnd, &job.line);
+            let _ = job.tx.send(reply);
+            0
+        }
         WM_CLOSE => {
-            println!("[dialog_proc] 收到 WM_CLOSE，销毁窗口");
             DestroyWindow(hwnd);
             0
         }
@@ -3194,6 +3755,12 @@ fn setup_dpi_awareness() {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--cli") {
+        cli::run(&args[i + 1..]);
+        return;
+    }
+
     println!("=== 图像处理查看器 ===");
     println!("基于 OpenCV + Win32 GDI");
     
@@ -3259,6 +3826,7 @@ fn main() {
         
         // 保存主窗口句柄到全局变量
         MAIN_HWND = Some(hwnd);
+        ipc::start_server(hwnd as isize);
 
         // 启用拖拽文件接受
         DragAcceptFiles(hwnd, 1); // 1表示接受拖拽文件
@@ -3266,6 +3834,9 @@ fn main() {
         // 显示和更新窗口
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+        if let Some(ref state) = IMAGE_STATE {
+            state.update_color_card_menu_state(hwnd);
+        }
 
         println!("✅ 程序启动成功！");
         println!("📁 使用菜单 文件->打开文件 来加载图像");
@@ -4488,6 +5059,10 @@ unsafe fn handle_drop_files(hwnd: HWND, hdrop: HDROP) {
                     match load_image_from_path(&file_path) {
                         Ok(_) => {
                             println!("✅ 成功加载拖拽的图像: {}", file_path);
+                            let state = IMAGE_STATE.as_mut().unwrap();
+                            state.update_sam_menu_state(hwnd);
+                            state.update_color_card_menu_state(hwnd);
+                            refresh_window_title(hwnd, state);
                             InvalidateRect(hwnd, null_mut(), 1);
                         }
                         Err(e) => {
@@ -4540,13 +5115,8 @@ fn load_image_from_path(file_path: &str) -> Result<()> {
         println!("🔍 检测到大图 ({}x{})，加载缩小版本以提升速度", img_w, img_h);
     }
     
-    // 使用OpenCV加载图像
-    let mut mat = imgcodecs::imread(file_path, imgcodecs::IMREAD_COLOR)
+    let mut mat = ImageState::read_bgr_from_path(file_path)
         .context("无法读取图像文件")?;
-    
-    if mat.empty() {
-        return Err(anyhow::anyhow!("图像文件为空或格式不受支持"));
-    }
     
     // 如果是大图，缩小到display_max_size
     if is_large_image {
@@ -4579,7 +5149,10 @@ fn load_image_from_path(file_path: &str) -> Result<()> {
             
             // 更新智能加载状态
             state.full_resolution_path = Some(file_path.to_string());
+            state.current_is_original = true;
             state.is_full_resolution_loaded = !is_large_image;
+            state.cancel_manual_perspective();
+            state.reset_color_card();
             
             // 重置缩放状态
             state.reset_zoom();
@@ -5321,13 +5894,10 @@ fn process_single_image_for_batch_with_settings(
     output_folder: &std::path::Path,
     settings: &BatchResizeSettings
 ) -> Result<()> {
-    // 加载图像
-    let mat = imgcodecs::imread(input_path.to_str().unwrap(), imgcodecs::IMREAD_COLOR)
+    let path_str = input_path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("文件路径不是有效 UTF-8"))?;
+    let mut mat = ImageState::read_bgr_from_path(path_str)
         .context("无法读取图像文件")?;
-
-    if mat.empty() {
-        return Err(anyhow::anyhow!("图像文件为空"));
-    }
 
     // 获取原始尺寸
     let original_width = mat.cols();
